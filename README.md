@@ -25,6 +25,10 @@ All results are normalized to clean JSON shapes (no HTML in the agent-facing out
 - **Admin role tagging is opt-in.** `/api/v1/organization.admins` only holds the org owner (not the team that comments), so the MCP deliberately doesn't use it as a team source. To get accurate `role: "admin"` tagging on comment and post authors, set `FEATUREBASE_TEAM_USER_IDS=id1,id2` in the env, or pass `teamUserIds` per-call to `get_featurebase_stalled_promises` after calling `find_featurebase_user`. Without one of these, every author shows `role: "unknown"` and engagement fields (`hasAdminReply`, etc.) are **omitted entirely** from `NormalizedPost` — the loud-failure contract. Silent wrong data ("customer" by default) was the most dangerous failure mode and is no longer possible.
 - **No writes.** Reading only — posting comments, voting, changing status all require authenticated API access, gated to Featurebase's $59/seat/mo Professional plan. Out of scope for a reverse-engineered scraper.
 
+## What changed: validation errors are now path-aware
+
+Earlier the MCP leaked Zod's raw issue dump into MCP error responses when callers passed out-of-range arguments (e.g. `minDaysSinceAdminReply: 9999`). The SDK's `Input validation error: Invalid arguments for tool name: [ { code: 'too_big', ... } ]` exposed internal schema shape. A global Zod errorMap now formats every issue as `path: must be at most N (got V)` before the SDK wraps it, so callers get `minDaysSinceAdminReply: must be at most 365 (got 9999)` instead.
+
 ## What changed: comments + engagement ship
 
 Two earlier limitations are now closed:
@@ -48,13 +52,15 @@ The `truncated` flag tells you when the SSR snapshot doesn't cover the full boar
 Each post in `posts[]` carries engagement metadata: `hasAdminReply`, `adminReplyCount`, `customerCommentCount`, `lastCommentDate`, `adminLastReplyDate`, `customerLastReplyDate`, and `commentFetchFailed` (only set when the comments fetch failed for that post). The enrichment is eager — every post with `commentCount > 0` has its comment thread fetched once during listing, with concurrency capped at 8 to avoid hammering the API. On a 56-post board with 33 having comments, this costs ~33 comment fetches on first listing miss and zero on cache hits.
 
 ### `get_featurebase_post`
-**Args:** `slug` (required), `include_comments?` (default `false`)
+**Args:** `slug` (required), `include_comments?` (default `false`), `teamUserIds?` (string[] — runtime override)
 
 **Returns:** `{ ...NormalizedPost, contentHtml, contentText, comments?: NormalizedComment[], commentsError?: string }`
 
 **Always returns the full body** (contentHtml + contentText inlined on the post object) — there is no content switch on this endpoint. When `include_comments=true`, the full comment thread is inlined as a nested `comments` array (top-level comments with `replies[]` for replies). Each comment carries author (name, userId, role), bodyHtml, bodyText, createdAt, updatedAt, upvotes, parentId. If the comments fetch fails, the post is still returned with `commentsError` set — no silent degradation.
 
-To surface "team replied" vs "customer replied", set `FEATUREBASE_TEAM_USER_IDS` in the env (comma-separated user IDs). See "Admin role tagging" under Known limitations.
+When `teamUserIds` is passed, comment authors (and engagement fields) are re-classified using these IDs as the team — useful for drilling into a single thread after calling `find_featurebase_user`. Overrides the env var for this call only.
+
+To surface "team replied" vs "customer replied" by default (without the per-call override), set `FEATUREBASE_TEAM_USER_IDS` in the env (comma-separated user IDs). See "Admin role tagging" under Known limitations.
 
 ### `get_featurebase_posts` (batch)
 **Args:** `slugs` (required, 1–20), `include_content?` (default `false`)

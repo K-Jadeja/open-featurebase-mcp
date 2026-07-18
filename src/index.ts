@@ -8,6 +8,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z, ZodErrorMap } from "zod";
 
 import { listPosts, ListPostsArgsSchema } from "./tools/list-posts.js";
 import { getPost, GetPostArgsSchema } from "./tools/get-post.js";
@@ -21,6 +22,54 @@ const server = new McpServer({
   name: "featurebase-mcp",
   version: "1.0.0",
 });
+
+// ---------------------------------------------------------------------------
+// Global Zod errorMap — produces clean, path-aware error messages for every
+// tool validation. Runs BEFORE the SDK wraps the message into McpError, so
+// the agent sees the formatted text (not Zod's raw issue dump).
+// ---------------------------------------------------------------------------
+
+const humanErrorMap: ZodErrorMap = (issue, ctx) => {
+  const path = (issue.path ?? []).join(".") || "argument";
+  const inputVal = "input" in ctx ? ctx.input : undefined;
+
+  switch (issue.code) {
+    case z.ZodIssueCode.too_big: {
+      const bound = issue.maximum;
+      const got = inputVal === undefined ? "" : ` (got ${JSON.stringify(inputVal)})`;
+      return {
+        message: `${path}: must be at most ${bound}${issue.inclusive ? "" : " (exclusive)"}${got}`,
+      };
+    }
+    case z.ZodIssueCode.too_small: {
+      const bound = issue.minimum;
+      const got = inputVal === undefined ? "" : ` (got ${JSON.stringify(inputVal)})`;
+      return {
+        message: `${path}: must be at least ${bound}${issue.inclusive ? "" : " (exclusive)"}${got}`,
+      };
+    }
+    case z.ZodIssueCode.invalid_type:
+      return {
+        message: `${path}: expected ${issue.expected}, received ${issue.received}`,
+      };
+    case z.ZodIssueCode.invalid_enum_value:
+      return {
+        message: `${path}: must be one of ${issue.options.join(", ")}`,
+      };
+    case z.ZodIssueCode.invalid_string:
+      return { message: `${path}: ${issue.validation}` };
+    case z.ZodIssueCode.unrecognized_keys:
+      return {
+        message: `${path}: unrecognized keys ${JSON.stringify(issue.keys)}`,
+      };
+    default:
+      return {
+        message: `${path}: ${issue.message ?? "invalid"}`,
+      };
+  }
+};
+
+z.setErrorMap(humanErrorMap);
 
 server.tool(
   "list_featurebase_posts",

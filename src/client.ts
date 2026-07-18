@@ -737,6 +737,25 @@ function walkComments(
   }
 }
 
+/**
+ * Return a new comment tree with each author's role re-classified using
+ * the provided team set. Used by get_featurebase_post when teamUserIds
+ * is passed at call time to override the default team.
+ */
+function reclassifyTree(
+  comments: NormalizedComment[],
+  team: { set: ReadonlySet<string>; configured: boolean },
+): NormalizedComment[] {
+  return comments.map((c) => ({
+    ...c,
+    author: enrichAuthor(
+      { name: c.author.name, picture: c.author.picture, userId: c.author.userId },
+      team,
+    ),
+    replies: reclassifyTree(c.replies, team),
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // Public client surface
 // ---------------------------------------------------------------------------
@@ -821,6 +840,7 @@ export const client = {
   async getPost(
     slug: string,
     includeComments: boolean,
+    teamUserIds?: string[],
   ): Promise<NormalizedPostDetail> {
     const all = await getAllPosts();
     const post = all.normalized.find((p) => p.slug === slug);
@@ -834,14 +854,47 @@ export const client = {
     const contentHtml = raw.content ?? "";
     const contentText = htmlToText(contentHtml);
 
+    const teamOverride =
+      teamUserIds && teamUserIds.length > 0
+        ? { set: new Set(teamUserIds), configured: true }
+        : null;
+
+    // Re-classify engagement fields on the post under the override team, if
+    // the post has comments and comments are available (cached after first
+    // listing miss). Always best-effort — if comments are missing or fetch
+    // fails, fall back to the listing's pre-computed engagement.
+    let postWithOverride: NormalizedPost = post;
+    if (
+      teamOverride &&
+      post.commentCount > 0 &&
+      !post.commentFetchFailed
+    ) {
+      try {
+        const comments = await getComments(post.id);
+        const eng = computeEngagementWithTeamOverride(
+          comments,
+          teamOverride.set,
+        );
+        postWithOverride = { ...post, ...eng };
+      } catch (err) {
+        console.error(
+          `[featurebase-mcp] getPost: engagement re-classify failed for ${slug}:`,
+          err,
+        );
+      }
+    }
+
     if (!includeComments) {
-      return { ...post, contentHtml, contentText };
+      return { ...postWithOverride, contentHtml, contentText };
     }
 
     let comments: NormalizedComment[] | undefined;
     let commentsError: string | undefined;
     try {
-      comments = await getComments(post.id);
+      const rawComments = await getComments(post.id);
+      comments = teamOverride
+        ? reclassifyTree(rawComments, teamOverride)
+        : rawComments;
     } catch (err) {
       // Don't fail the post fetch because comments broke. Surface the error
       // so the agent can decide what to do, but keep the post intact.
@@ -852,7 +905,7 @@ export const client = {
       );
     }
     return {
-      ...post,
+      ...postWithOverride,
       contentHtml,
       contentText,
       comments,
