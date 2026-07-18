@@ -34,9 +34,10 @@ server.tool(
   "get_featurebase_post",
   "Get a single post by its slug. ALWAYS returns the full body " +
     "(contentHtml + contentText inlined on the post object) — there is no " +
-    "content switch on this endpoint. The include_comments parameter is " +
-    "NOT supported — comment bodies are loaded via client-side JS we cannot " +
-    "reach; setting include_comments=true will throw. The post's " +
+    "content switch on this endpoint. Set include_comments=true to also " +
+    "inline the full comment thread as a nested `comments` array; each " +
+    "comment carries author.role='admin'|'customer' so the agent can " +
+    "distinguish team replies from customer messages. The post's " +
     "commentCount is always returned in the metadata.",
   GetPostArgsSchema,
   getPost,

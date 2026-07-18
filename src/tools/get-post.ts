@@ -12,9 +12,12 @@ export const GetPostArgsSchema = {
     .boolean()
     .default(false)
     .describe(
-      "NOT SUPPORTED — Featurebase post detail pages load comments via client-side JS we cannot reach. " +
-        "Setting this to true will throw an error. Use commentCount from the post metadata instead, " +
-        "or open the post URL in a browser to read the full thread. Default: false.",
+      "If true, fetch and inline the full comment thread as a `comments` " +
+        "array on the response (nested with `replies`). Each comment carries " +
+        "author (name, userId, role='admin'|'customer'), bodyHtml, bodyText, " +
+        "createdAt, updatedAt, upvotes, parentId, and replies[]. On fetch " +
+        "failure the post is still returned with `commentsError` set. " +
+        "Default: false.",
     ),
 };
 

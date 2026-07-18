@@ -20,8 +20,8 @@ All results are normalized to clean JSON shapes (no HTML in the agent-facing out
 
 ## Known limitations (be honest with your agent)
 
-- **Comment bodies are not supported (and the API fails loudly if you ask).** Post detail pages (`/posts/<slug>`) are statically rendered as Next.js 404 shells — the dynamic post data, including the comment thread, is loaded by client-side JS. `get_featurebase_post` accepts an `include_comments` parameter for API stability, but if you set it to `true` the tool throws an `McpError` with a clear explanation rather than silently returning null. The `commentCount` field IS available because it's in the listing payload with each post.
-- **What you CAN reliably read:** post titles, slugs, 800-char plain-text excerpts (with `…` when truncated), full HTML body (stripped in `contentText`), canonical `url` for each post, upvote counts, statuses, authors, dates, categories, and comment counts.
+- **Admin role tagging is best-effort.** Featurebase's `/api/v1/organization.admins` field holds the **org owner**, not the full team that comments on the board. To get accurate `role: "admin"` tagging on comment and post authors, set `FEATUREBASE_TEAM_USER_IDS=id1,id2` (comma-separated user IDs) in the env. Without it, comment authors will usually show `role: "customer"` even if they're your team.
+- **No writes.** Reading only — posting comments, voting, changing status all require authenticated API access, gated to Featurebase's $59/seat/mo Professional plan. Out of scope for a reverse-engineered scraper.
 
 ## What changed: pagination ships
 
@@ -37,11 +37,13 @@ Earlier versions of this MCP were limited to the ~20 posts the SSR `__NEXT_DATA_
 The `truncated` flag tells you when the SSR snapshot doesn't cover the full board.
 
 ### `get_featurebase_post`
-**Args:** `slug` (required), `include_comments?` (default `false` — setting to `true` throws)
+**Args:** `slug` (required), `include_comments?` (default `false`)
 
-**Returns:** `{ ...NormalizedPost, contentHtml, contentText }`
+**Returns:** `{ ...NormalizedPost, contentHtml, contentText, comments?: NormalizedComment[], commentsError?: string }`
 
-**Always returns the full body** (contentHtml + contentText inlined on the post object) — there is no content switch on this endpoint. Comments throw loudly if requested (no silent degradation).
+**Always returns the full body** (contentHtml + contentText inlined on the post object) — there is no content switch on this endpoint. When `include_comments=true`, the full comment thread is inlined as a nested `comments` array (top-level comments with `replies[]` for replies). Each comment carries author (name, userId, role), bodyHtml, bodyText, createdAt, updatedAt, upvotes, parentId. If the comments fetch fails, the post is still returned with `commentsError` set — no silent degradation.
+
+To surface "team replied" vs "customer replied", set `FEATUREBASE_TEAM_USER_IDS` in the env (comma-separated user IDs). See "Admin role tagging" under Known limitations.
 
 ### `get_featurebase_posts` (batch)
 **Args:** `slugs` (required, 1–20), `include_content?` (default `false`)
@@ -110,6 +112,7 @@ npm run dev
 | Env var | Default | Purpose |
 |---|---|---|
 | `FEATUREBASE_BOARD_URL` | `https://itsremalt.featurebase.app` | Point at a different public Featurebase board |
+| `FEATUREBASE_TEAM_USER_IDS` | (unset) | Comma-separated Featurebase user IDs considered team/admins. Combined with `/api/v1/organization.admins` for role tagging on comment + post authors. |
 
 Changes require a server restart.
 
@@ -117,9 +120,11 @@ Changes require a server restart.
 
 1. `GET {BASE_URL}/api/v1/submission?sortBy=date:desc&inReview=false&includePinned=true&page=N` returns JSON directly (the SPA's axios baseURL is `/api`).
 2. First call to page 1 discovers `totalPages` + `totalResults`. Remaining pages are fetched in parallel via `Promise.allSettled` so a single failed page doesn't take down the whole listing.
-3. All pages are concatenated into a single in-memory snapshot, normalized (HTML stripped, fields flattened), and cached for 5 minutes.
-4. Filter/sort happen client-side so the cache stays valid across all sort orders and filter combinations.
-5. No DOM scraping, no cheerio, no HTML parsing — JSON throughout. Comment bodies are NOT scraped (Featurebase loads them via client-side JS against internal endpoints we can't reach from a non-browser fetch). The `commentCount` field IS available because it ships with each post.
+3. `/api/v1/organization` is fetched in parallel with the listing to enrich each post's author with a `role` tag. Cached 1 hour.
+4. All pages are concatenated into a single in-memory snapshot, normalized (HTML stripped, fields flattened), and cached for 5 minutes.
+5. Filter/sort happen client-side so the cache stays valid across all sort orders and filter combinations.
+6. When `get_featurebase_post(include_comments=true)` is called, `/api/v1/comment?submissionId=<id>` fetches the comment thread (top-level comments only — nested replies ship inside each comment's `replies` array). Tree is preserved server-side; we just normalize authors + sort by `createdAt`. Cached 5 min per submission.
+7. No DOM scraping, no cheerio, no HTML parsing — JSON throughout.
 
 ## Troubleshooting
 
@@ -130,13 +135,16 @@ The board's API host may have changed (unlikely — has been stable for months).
 The board's Cloudflare or bot protection is blocking the request. The MCP doesn't retry on the API (would multiply cost without much benefit). Try again after a short delay, or fall back to opening the board in a browser.
 
 **Stale data**
-In-memory cache, TTL-based (5 min). Restart the server to flush.
+In-memory cache, TTL-based (5 min for listing + comments, 1 hour for org). Restart the server to flush.
 
 **`truncated: true` in responses**
 Means one or more pages failed to fetch — partial snapshot. Use `snapshotSize` vs `totalResults` to see the gap. Restart the server to retry.
 
-**Comments always return `null`**
-Expected behavior. Post detail pages are static 404 shells; comment threads load via client-side JS we can't execute. The `commentCount` field is always available from the listing payload.
+**Comments fetch fails**
+`get_featurebase_post` will still return the post; check `commentsError` for the reason. Common causes: `submissionId` missing on the post (shouldn't happen with current listing payloads), network error, or the comment endpoint returning an unexpected shape. Restart retries.
+
+**All comment authors show `role: "customer"`**
+The team's user IDs aren't in `/api/v1/organization.admins` (Featurebase stores the org owner there, not your comment-reply team). Set `FEATUREBASE_TEAM_USER_IDS=id1,id2` in the env to override. IDs are visible in any comment's `author.userId`.
 
 ## License
 

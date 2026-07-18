@@ -16,6 +16,9 @@
 
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type {
+  CommentRole,
+  NormalizedAuthor,
+  NormalizedComment,
   NormalizedPost,
   NormalizedPostDetail,
 } from "./types.js";
@@ -36,7 +39,25 @@ const REQUEST_TIMEOUT_MS = 15_000;
 
 const TTL = {
   listing: 300, // 5 min — covers all metadata reads
+  comments: 300, // 5 min — matches listing so engagement views stay consistent
+  org: 3600, // 1 hour — org membership rarely changes
 } as const;
+
+/**
+ * Comma-separated Featurebase user IDs considered team/admin for role tagging.
+ *
+ * Falls back to empty when unset. Note: `/api/v1/organization.admins[]`
+ * is the org OWNER, not necessarily the team that comments on the board.
+ * Set this env var to the user IDs of your team so the comment author
+ * `role` field lights up correctly. IDs are visible in any post's author
+ * `.userId` or any comment's author `.userId`.
+ */
+const TEAM_USER_IDS: Set<string> = new Set(
+  (process.env.FEATUREBASE_TEAM_USER_IDS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
 
 // ---------------------------------------------------------------------------
 // Cache (Map + timestamps; 2 keys total so no class needed)
@@ -100,11 +121,32 @@ function normalizeStatus(raw: any): NormalizedPost["status"] {
   };
 }
 
-function normalizeAuthor(raw: any): NormalizedPost["author"] {
+/**
+ * Build the basic author shape (no role yet). Role is assigned separately
+ * by `enrichAuthor` once the team-user-id set is available.
+ */
+function normalizeAuthorBasic(raw: any): Omit<NormalizedAuthor, "role"> {
   return {
     name: raw?.name ?? "Anonymous",
     picture: raw?.picture,
+    userId: raw?._id ?? raw?.createdBy ?? "",
   };
+}
+
+/**
+ * Decide role for an author by user ID. "admin" if userId is in the org
+ * admin set (cached) or the FEATUREBASE_TEAM_USER_IDS env var; "customer"
+ * otherwise.
+ */
+function enrichAuthor(
+  base: Omit<NormalizedAuthor, "role">,
+  orgAdminIds: ReadonlySet<string>,
+): NormalizedAuthor {
+  const role: CommentRole =
+    TEAM_USER_IDS.has(base.userId) || orgAdminIds.has(base.userId)
+      ? "admin"
+      : "customer";
+  return { ...base, role };
 }
 
 function normalizeCategory(raw: any): string {
@@ -115,12 +157,16 @@ function normalizeCategory(raw: any): string {
   return "Uncategorized";
 }
 
-function normalizePost(raw: any): NormalizedPost {
+function normalizePost(
+  raw: any,
+  orgAdminIds: ReadonlySet<string>,
+): NormalizedPost {
   const fullText = htmlToText(raw.content ?? "");
   const EXCERPT_LIMIT = 800;
   const truncated = fullText.length > EXCERPT_LIMIT;
   return {
     slug: raw.slug,
+    id: raw.id ?? "",
     title: raw.title,
     excerpt: truncated
       ? fullText.slice(0, EXCERPT_LIMIT).trimEnd() + "…"
@@ -129,9 +175,28 @@ function normalizePost(raw: any): NormalizedPost {
     status: normalizeStatus(raw.postStatus),
     upvotes: raw.upvotes ?? 0,
     commentCount: raw.commentCount ?? 0,
-    author: normalizeAuthor(raw.user),
+    author: enrichAuthor(normalizeAuthorBasic(raw.user), orgAdminIds),
     date: raw.date ?? "",
     category: normalizeCategory(raw.postCategory),
+  };
+}
+
+function normalizeComment(
+  raw: any,
+  orgAdminIds: ReadonlySet<string>,
+): NormalizedComment {
+  return {
+    id: raw.id,
+    author: enrichAuthor(normalizeAuthorBasic(raw.user), orgAdminIds),
+    bodyHtml: raw.content ?? "",
+    bodyText: htmlToText(raw.content ?? ""),
+    createdAt: raw.createdAt ?? "",
+    updatedAt: raw.updatedAt ?? "",
+    upvotes: raw.upvotes ?? 0,
+    parentId: raw.parentComment ?? null,
+    replies: Array.isArray(raw.replies)
+      ? raw.replies.map((r: any) => normalizeComment(r, orgAdminIds))
+      : [],
   };
 }
 
@@ -203,8 +268,13 @@ async function getAllPosts(): Promise<ListingPayload> {
   const cached = cacheGet<ListingPayload>(cacheKey);
   if (cached) return cached;
 
-  // Fetch page 1 to discover totalPages + totalResults.
-  const first = await fetchApiPage(1);
+  // Fetch page 1 + org admin set in parallel. Both are needed to build the
+  // listing payload: page 1 discovers totalPages, the org set enriches each
+  // post's author with a role tag.
+  const [first, orgAdminIds] = await Promise.all([
+    fetchApiPage(1),
+    getOrgAdminIds(),
+  ]);
   const totalPages = first.totalPages;
   const totalResults = first.totalResults;
 
@@ -221,7 +291,7 @@ async function getAllPosts(): Promise<ListingPayload> {
   }
 
   const raw = successfulPages.flatMap((p) => p.results);
-  const normalized = raw.map(normalizePost);
+  const normalized = raw.map((r) => normalizePost(r, orgAdminIds));
   const out: ListingPayload = {
     raw,
     normalized,
@@ -233,30 +303,175 @@ async function getAllPosts(): Promise<ListingPayload> {
 }
 
 // ---------------------------------------------------------------------------
-// Comments — UNSUPPORTED
+// Organization + comments fetchers
 //
-// Featurebase post detail pages (`/posts/<slug>`) are statically rendered as
-// 404 shells by Next.js; the dynamic post data, including the comment thread,
-// is loaded by client-side JavaScript that calls internal API endpoints we
-// can't reach from a non-browser fetch. As a result, comment BODIES are not
-// scrapable from public HTML.
+// The Featurebase SPA exposes the JSON endpoints the client components call:
 //
-// The `commentCount` field IS still available — it ships with each post in
-// the SSR-bundled listing payload.
+//   GET /api/v1/organization
+//     → { admins: string[], owner: string, members: [...], ... }
+//     admins[] holds user IDs of org admins (typically the org OWNER only).
+//     Cached 1h; membership rarely changes.
 //
-// If a caller asks for comments, we throw loudly rather than silently
-// returning null. Silent degradation on data fetches is a footgun.
+//   GET /api/v1/comment?submissionId=<id>
+//     → { results: [Comment], page, limit, totalPages, totalResults }
+//     Top-level comments only; nested replies live on each comment's
+//     `replies` array. Threading is preserved server-side, so we don't have
+//     to rebuild the tree from a flat list.
+//
+//   Submission IDs are NOT the same as slugs. The slug is the URL path
+//   segment (`/posts/<slug>`); the submission ID is the DB `_id` (or `id`
+//   in listing payloads — they're equal here). To fetch comments for a
+//   post by slug, look up the slug in the listing payload first.
 // ---------------------------------------------------------------------------
 
-function unsupportedCommentsError(): never {
-  throw new McpError(
-    ErrorCode.InternalError,
-    "Comment bodies are not available from the public board HTML — Featurebase " +
-      "loads them via client-side JavaScript against internal API endpoints " +
-      "we cannot reach. The post's commentCount is included in the metadata " +
-      "returned by get_featurebase_post; visit the post URL directly in a " +
-      "browser to read the full comment thread.",
+interface OrgPayload {
+  admins: string[];
+  owner: string | null;
+}
+
+async function fetchOrg(): Promise<OrgPayload> {
+  const url = `${BASE_URL}/api/v1/organization`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "application/json, text/plain, */*",
+        Referer: `${BASE_URL}/`,
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `HTTP ${res.status} fetching ${url}`,
+      );
+    }
+    const data = (await res.json()) as any;
+    return {
+      admins: Array.isArray(data?.admins) ? data.admins : [],
+      owner: typeof data?.owner === "string" ? data.owner : null,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function getOrgAdminIds(): Promise<Set<string>> {
+  const cacheKey = "org:admins";
+  const cached = cacheGet<Set<string>>(cacheKey);
+  if (cached) return cached;
+  try {
+    const org = await fetchOrg();
+    const set = new Set<string>(org.admins);
+    cacheSet(cacheKey, set, TTL.org);
+    return set;
+  } catch (err) {
+    // Don't break the whole listing because the org endpoint hiccupped.
+    // Role tagging will degrade to "customer" for everyone.
+    console.error(
+      "[featurebase-mcp] failed to fetch /api/v1/organization; " +
+        "falling back to empty admin set. Set FEATUREBASE_TEAM_USER_IDS " +
+        "to override. Error:",
+      err,
+    );
+    const empty: Set<string> = new Set();
+    cacheSet(cacheKey, empty, TTL.org);
+    return empty;
+  }
+}
+
+interface CommentsApiResponse {
+  results: any[];
+  page: number;
+  limit: number;
+  totalPages: number;
+  totalResults: number;
+}
+
+async function fetchCommentsPage(
+  submissionId: string,
+  page: number,
+): Promise<CommentsApiResponse> {
+  const url =
+    `${BASE_URL}/api/v1/comment?submissionId=${encodeURIComponent(submissionId)}` +
+    `&page=${page}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "application/json, text/plain, */*",
+        Referer: `${BASE_URL}/posts/`,
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `HTTP ${res.status} fetching comments for submission ${submissionId}`,
+      );
+    }
+    const data = (await res.json()) as CommentsApiResponse;
+    if (!Array.isArray(data.results)) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Unexpected /api/v1/comment response shape: missing results array`,
+      );
+    }
+    return data;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Fetch all pages of the comment thread for a submission, normalized to a
+ * tree (top-level comments + nested replies). Returns [] if the post has no
+ * comments.
+ */
+async function getComments(submissionId: string): Promise<NormalizedComment[]> {
+  if (!submissionId) return [];
+  const cacheKey = `comments:${submissionId}`;
+  const cached = cacheGet<NormalizedComment[]>(cacheKey);
+  if (cached) return cached;
+
+  const orgAdminIds = await getOrgAdminIds();
+
+  const first = await fetchCommentsPage(submissionId, 1);
+  const totalPages = first.totalPages;
+  const rest = await Promise.allSettled(
+    Array.from({ length: Math.max(0, totalPages - 1) }, (_, i) =>
+      fetchCommentsPage(submissionId, i + 2),
+    ),
   );
+  const allRaw = [
+    ...first.results,
+    ...rest
+      .filter((r): r is PromiseFulfilledResult<CommentsApiResponse> => r.status === "fulfilled")
+      .flatMap((r) => r.value.results),
+  ];
+
+  // The server nests replies inside each top-level comment's `replies`
+  // array; the flat `results` array contains only top-level comments when
+  // pagination > 1. We pass orgAdminIds into the recursive normalizer so
+  // every nested reply's author gets a role tag.
+  const tree = allRaw.map((r) => normalizeComment(r, orgAdminIds));
+
+  // Sort replies within each node by createdAt asc, and roots too.
+  function sortReplies(node: NormalizedComment): void {
+    node.replies.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    for (const r of node.replies) sortReplies(r);
+  }
+  for (const root of tree) sortReplies(root);
+  tree.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+  cacheSet(cacheKey, tree, TTL.comments);
+  return tree;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,27 +560,40 @@ export const client = {
     includeComments: boolean,
   ): Promise<NormalizedPostDetail> {
     const all = await getAllPosts();
-    const raw = all.raw.find((p) => p.slug === slug);
-    if (!raw) {
+    const post = all.normalized.find((p) => p.slug === slug);
+    if (!post) {
       throw new McpError(
         ErrorCode.InvalidRequest,
         `Post not found: "${slug}". Use list_featurebase_posts to discover valid slugs.`,
       );
     }
-
-    if (includeComments) {
-      // Loud failure — comments are not scrapable. Don't silently degrade.
-      unsupportedCommentsError();
-    }
-
-    const post = normalizePost(raw);
+    const raw = all.raw.find((p) => p.slug === slug)!;
     const contentHtml = raw.content ?? "";
     const contentText = htmlToText(contentHtml);
 
+    if (!includeComments) {
+      return { ...post, contentHtml, contentText };
+    }
+
+    let comments: NormalizedComment[] | undefined;
+    let commentsError: string | undefined;
+    try {
+      comments = await getComments(post.id);
+    } catch (err) {
+      // Don't fail the post fetch because comments broke. Surface the error
+      // so the agent can decide what to do, but keep the post intact.
+      commentsError = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[featurebase-mcp] comments fetch failed for ${slug}:`,
+        err,
+      );
+    }
     return {
       ...post,
       contentHtml,
       contentText,
+      comments,
+      commentsError,
     };
   },
 
@@ -482,13 +710,13 @@ export const client = {
     const notFound: string[] = [];
 
     for (const slug of args.slugs) {
-      const raw = all.raw.find((p) => p.slug === slug);
-      if (!raw) {
+      const post = all.normalized.find((p) => p.slug === slug);
+      if (!post) {
         notFound.push(slug);
         continue;
       }
-      const post = normalizePost(raw);
       if (includeContent) {
+        const raw = all.raw.find((p) => p.slug === slug)!;
         const contentHtml = raw.content ?? "";
         found.push({
           ...post,
