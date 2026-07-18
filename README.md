@@ -6,15 +6,16 @@ A reverse-engineered Model Context Protocol (MCP) server for the [itsremalt Feat
 
 ## What it does
 
-Five read-only tools:
+Six read-only tools:
 
 | Tool | Purpose |
 |---|---|
-| `list_featurebase_posts` | List posts, filterable by status, sortable by date/upvotes |
-| `get_featurebase_post` | Get one post by slug + full body |
+| `list_featurebase_posts` | List posts, filterable by status, sortable by date/upvotes. Posts carry engagement metadata (admin/customer reply counts + dates). |
+| `get_featurebase_post` | Get one post by slug + full body + optional comment thread |
 | `get_featurebase_posts` | **Batch fetch** multiple posts in one call (no round-trip overhead) |
 | `search_featurebase_posts` | Keyword search over titles + bodies, ranked by relevance |
 | `get_featurebase_stats` | Board-wide aggregates: counts by status, top-voted, most recent |
+| `get_featurebase_stalled_promises` | Find posts where admin replied, customer spoke last, and admin has been silent for N+ days. Surfaces follow-ups you promised but forgot. |
 
 All results are normalized to clean JSON shapes (no HTML in the agent-facing output, just structured data + plain-text excerpts).
 
@@ -78,6 +79,15 @@ Returns posts in the order requested. Missing slugs go into `notFound` instead o
 `snapshotWindow` is `{ from: "YYYY-MM-DD", to: "YYYY-MM-DD", ordering: "date desc" }` — the actual date range the SSR snapshot covers. Makes `truncated` actionable: with the window, you know whether the snapshot is "everything recent" or just a thin slice.
 
 Counts are labeled `*InSnapshot` to make it explicit they're computed over the SSR-bundled subset, not the full board.
+
+### `get_featurebase_stalled_promises`
+**Args:** `minDaysSinceAdminReply?` (0–365, default 7), `limit?` (1–50, default 20)
+
+**Returns:** `{ minDaysSinceAdminReply, totalCandidates, returned, promises: StalledPromise[] }`
+
+Each `StalledPromise` carries: `slug`, `title`, `url`, `status`, `commentCount`, `upvotes`, `author`, `date`, `adminLastReplyDate`, `customerLastReplyDate`, `daysSinceAdminReply`, `lastAdminMessage` (200-char excerpt + author + date), `lastCustomerMessage` (200-char excerpt + author + date). Sorted by `customerLastReplyDate` desc.
+
+This is the "I said I'd look into it in a comment and forgot to follow up" view. Requires `FEATUREBASE_TEAM_USER_IDS` to be set so admins can be distinguished from customers in the thread — see "Admin role tagging" under Known limitations.
 
 ## Install
 

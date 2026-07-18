@@ -14,6 +14,7 @@ import { getPost, GetPostArgsSchema } from "./tools/get-post.js";
 import { getPosts, GetPostsArgsSchema } from "./tools/get-posts.js";
 import { searchPosts, SearchPostsArgsSchema } from "./tools/search-posts.js";
 import { getStats, GetStatsArgsSchema } from "./tools/get-stats.js";
+import { getStalledPromises, GetStalledPromisesArgsSchema } from "./tools/get-stalled-promises.js";
 
 const server = new McpServer({
   name: "featurebase-mcp",
@@ -74,6 +75,19 @@ server.tool(
     "the date range the SSR snapshot actually covers.",
   GetStatsArgsSchema,
   getStats,
+);
+
+server.tool(
+  "get_featurebase_stalled_promises",
+  "Find posts where an admin (team) replied in a comment and the customer " +
+    "spoke last, and the admin has been silent for at least " +
+    "minDaysSinceAdminReply days (default 7). Returns each stalled post's " +
+    "slug, title, status, daysSinceAdminReply, and 200-char excerpts of " +
+    "both the last admin message and the last customer message. Sorted " +
+    "by customerLastReplyDate desc (most recent first). Use this to find " +
+    "follow-ups you promised in comments but never came back to.",
+  GetStalledPromisesArgsSchema,
+  getStalledPromises,
 );
 
 // ---------------------------------------------------------------------------

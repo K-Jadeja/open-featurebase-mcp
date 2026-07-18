@@ -598,6 +598,25 @@ async function mapWithConcurrency<T, R>(
 /** Max parallel comment fetches during listing enrichment. */
 const COMMENTS_CONCURRENCY = 8;
 
+/**
+ * Walk a comment tree and return the chronologically last comment by an
+ * author with the given role. Returns null if no comment matches.
+ */
+function findLastCommentByRole(
+  comments: NormalizedComment[],
+  role: CommentRole,
+): NormalizedComment | null {
+  let last: NormalizedComment | null = null;
+  function walk(c: NormalizedComment): void {
+    if (c.author.role === role) {
+      if (!last || c.createdAt > last.createdAt) last = c;
+    }
+    for (const r of c.replies) walk(r);
+  }
+  for (const c of comments) walk(c);
+  return last;
+}
+
 // ---------------------------------------------------------------------------
 // Public client surface
 // ---------------------------------------------------------------------------
@@ -823,6 +842,121 @@ export const client = {
       categoryCountsInSnapshot,
       topVoted,
       recent,
+    };
+  },
+
+  /**
+   * Find posts where an admin replied and the customer spoke last, and the
+   * admin has been silent for at least `minDaysSinceAdminReply` days.
+   *
+   * This is the "I promised something in a comment and forgot to follow up"
+   * view. Sorted by customerLastReplyDate desc (most recent first).
+   *
+   * Requires the engagement metadata populated by getAllPosts — both
+   * adminLastReplyDate and customerLastReplyDate must be set (i.e. comment
+   * fetch succeeded for the post).
+   */
+  async getStalledPromises(args: {
+    minDaysSinceAdminReply?: number;
+    limit?: number;
+  } = {}) {
+    const minDays = Math.max(0, Math.floor(args.minDaysSinceAdminReply ?? 7));
+    const limit = Math.max(1, Math.min(args.limit ?? 20, 50));
+    const all = await getAllPosts();
+    const now = Date.now();
+    const minMs = minDays * 24 * 60 * 60 * 1000;
+
+    // Candidate filter: customer spoke after admin, both dates present,
+    // and the comments fetch didn't fail for this post.
+    const candidates = all.normalized.filter((p) => {
+      if (p.commentFetchFailed) return false;
+      if (!p.adminLastReplyDate || !p.customerLastReplyDate) return false;
+      if (p.customerLastReplyDate <= p.adminLastReplyDate) return false;
+      return now - new Date(p.adminLastReplyDate).getTime() >= minMs;
+    });
+
+    candidates.sort((a, b) =>
+      (b.customerLastReplyDate ?? "").localeCompare(
+        a.customerLastReplyDate ?? "",
+      ),
+    );
+
+    const sliced = candidates.slice(0, limit);
+
+    // For each candidate, fetch the full comment thread (cache hit if already
+    // loaded during listing enrichment) to extract the actual messages.
+    const enriched = await mapWithConcurrency(
+      sliced,
+      COMMENTS_CONCURRENCY,
+      async (p) => {
+        let lastAdminMsg: {
+          author: { name: string; userId: string; role: CommentRole };
+          date: string;
+          excerpt: string;
+        } | null = null;
+        let lastCustomerMsg: {
+          author: { name: string; userId: string; role: CommentRole };
+          date: string;
+          excerpt: string;
+        } | null = null;
+        try {
+          const comments = await getComments(p.id);
+          const lastAdmin = findLastCommentByRole(comments, "admin");
+          const lastCustomer = findLastCommentByRole(comments, "customer");
+          if (lastAdmin) {
+            lastAdminMsg = {
+              author: {
+                name: lastAdmin.author.name,
+                userId: lastAdmin.author.userId,
+                role: lastAdmin.author.role,
+              },
+              date: lastAdmin.createdAt,
+              excerpt: lastAdmin.bodyText.slice(0, 200),
+            };
+          }
+          if (lastCustomer) {
+            lastCustomerMsg = {
+              author: {
+                name: lastCustomer.author.name,
+                userId: lastCustomer.author.userId,
+                role: lastCustomer.author.role,
+              },
+              date: lastCustomer.createdAt,
+              excerpt: lastCustomer.bodyText.slice(0, 200),
+            };
+          }
+        } catch (err) {
+          console.error(
+            `[featurebase-mcp] stalled-promises: comments fetch failed for ${p.slug}:`,
+            err,
+          );
+        }
+        return {
+          slug: p.slug,
+          title: p.title,
+          url: p.url,
+          status: p.status,
+          commentCount: p.commentCount,
+          upvotes: p.upvotes,
+          author: p.author,
+          date: p.date,
+          adminLastReplyDate: p.adminLastReplyDate!,
+          customerLastReplyDate: p.customerLastReplyDate!,
+          daysSinceAdminReply: Math.floor(
+            (now - new Date(p.adminLastReplyDate!).getTime()) /
+              (24 * 60 * 60 * 1000),
+          ),
+          lastAdminMessage: lastAdminMsg,
+          lastCustomerMessage: lastCustomerMsg,
+        };
+      },
+    );
+
+    return {
+      minDaysSinceAdminReply: minDays,
+      totalCandidates: candidates.length,
+      returned: enriched.length,
+      promises: enriched,
     };
   },
 
