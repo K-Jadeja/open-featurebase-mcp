@@ -15,6 +15,7 @@ import { getPosts, GetPostsArgsSchema } from "./tools/get-posts.js";
 import { searchPosts, SearchPostsArgsSchema } from "./tools/search-posts.js";
 import { getStats, GetStatsArgsSchema } from "./tools/get-stats.js";
 import { getStalledPromises, GetStalledPromisesArgsSchema } from "./tools/get-stalled-promises.js";
+import { findUser, FindUserArgsSchema } from "./tools/find-user.js";
 
 const server = new McpServer({
   name: "featurebase-mcp",
@@ -85,9 +86,26 @@ server.tool(
     "slug, title, status, daysSinceAdminReply, and 200-char excerpts of " +
     "both the last admin message and the last customer message. Sorted " +
     "by customerLastReplyDate desc (most recent first). Use this to find " +
-    "follow-ups you promised in comments but never came back to.",
+    "follow-ups you promised in comments but never came back to. " +
+    "If you don't have admin user IDs configured, ask the user for their " +
+    "name, call find_featurebase_user to look up the IDs, then pass them " +
+    "via teamUserIds.",
   GetStalledPromisesArgsSchema,
   getStalledPromises,
+);
+
+server.tool(
+  "find_featurebase_user",
+  "Look up Featurebase user IDs by partial name match. Scans post authors " +
+    "from the listing plus the comment threads of the N most recent posts " +
+    "with comments (sampleSize, default 5). Returns matching users with " +
+    "postCount, commentCount, and a guessedRole ('admin' if the user " +
+    "never posts but does comment, 'customer' otherwise). Use the returned " +
+    "userIds as teamUserIds in get_featurebase_stalled_promises — lets the " +
+    "agent run a stalled-promise query without setting FEATUREBASE_TEAM_USER_IDS " +
+    "in the env.",
+  FindUserArgsSchema,
+  findUser,
 );
 
 // ---------------------------------------------------------------------------

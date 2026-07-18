@@ -617,6 +617,90 @@ function findLastCommentByRole(
   return last;
 }
 
+/**
+ * Walk a comment tree and return the chronologically last comment for
+ * which `predicate` returns true. Used when the team set is overridden at
+ * call time — we can't use `author.role` (it's stale relative to the
+ * override), so we ask the caller to provide the membership test.
+ */
+function findLastCommentWhere(
+  comments: NormalizedComment[],
+  predicate: (c: NormalizedComment) => boolean,
+): NormalizedComment | null {
+  let last: NormalizedComment | null = null;
+  function walk(c: NormalizedComment): void {
+    if (predicate(c)) {
+      if (!last || c.createdAt > last.createdAt) last = c;
+    }
+    for (const r of c.replies) walk(r);
+  }
+  for (const c of comments) walk(c);
+  return last;
+}
+
+/**
+ * Apply a per-call team-user-id override to a comment tree. The cached
+ * `author.role` was computed using the server's default team set (env var
+ * + /api/v1/organization admins); when the caller passes a runtime
+ * override we re-classify each comment's author on the fly. Used by
+ * getStalledPromises so a single call can re-tag engagement.
+ */
+function computeEngagementWithTeamOverride(
+  comments: NormalizedComment[],
+  teamSet: ReadonlySet<string>,
+): EngagementFields {
+  let hasAdminReply = false;
+  let adminReplyCount = 0;
+  let customerCommentCount = 0;
+  let lastCommentDate: string | undefined;
+  let adminLastReplyDate: string | undefined;
+  let customerLastReplyDate: string | undefined;
+
+  function walk(comment: NormalizedComment): void {
+    const isAdmin = teamSet.has(comment.author.userId);
+    if (!lastCommentDate || comment.createdAt > lastCommentDate) {
+      lastCommentDate = comment.createdAt;
+    }
+    if (isAdmin) {
+      hasAdminReply = true;
+      adminReplyCount++;
+      if (!adminLastReplyDate || comment.createdAt > adminLastReplyDate) {
+        adminLastReplyDate = comment.createdAt;
+      }
+    } else {
+      customerCommentCount++;
+      if (!customerLastReplyDate || comment.createdAt > customerLastReplyDate) {
+        customerLastReplyDate = comment.createdAt;
+      }
+    }
+    for (const reply of comment.replies) walk(reply);
+  }
+
+  for (const c of comments) walk(c);
+  return {
+    hasAdminReply,
+    adminReplyCount,
+    customerCommentCount,
+    lastCommentDate,
+    adminLastReplyDate,
+    customerLastReplyDate,
+  };
+}
+
+/**
+ * Visit every comment in a tree (top-level + nested replies). Used by
+ * find_featurebase_user to scan authors across all threads.
+ */
+function walkComments(
+  comments: NormalizedComment[],
+  fn: (c: NormalizedComment) => void,
+): void {
+  for (const c of comments) {
+    fn(c);
+    walkComments(c.replies, fn);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public client surface
 // ---------------------------------------------------------------------------
@@ -854,11 +938,16 @@ export const client = {
    *
    * Requires the engagement metadata populated by getAllPosts — both
    * adminLastReplyDate and customerLastReplyDate must be set (i.e. comment
-   * fetch succeeded for the post).
+   * fetch succeeded for the post). When `teamUserIds` is passed, those
+   * IDs override the server's default team set (env var +
+   * /api/v1/organization admins) and engagement is re-classified on the
+   * fly from cached comments. Use this in tandem with
+   * `find_featurebase_user` to skip env-var configuration entirely.
    */
   async getStalledPromises(args: {
     minDaysSinceAdminReply?: number;
     limit?: number;
+    teamUserIds?: string[];
   } = {}) {
     const minDays = Math.max(0, Math.floor(args.minDaysSinceAdminReply ?? 7));
     const limit = Math.max(1, Math.min(args.limit ?? 20, 50));
@@ -866,25 +955,62 @@ export const client = {
     const now = Date.now();
     const minMs = minDays * 24 * 60 * 60 * 1000;
 
-    // Candidate filter: customer spoke after admin, both dates present,
-    // and the comments fetch didn't fail for this post.
-    const candidates = all.normalized.filter((p) => {
-      if (p.commentFetchFailed) return false;
+    const teamOverride =
+      args.teamUserIds && args.teamUserIds.length > 0
+        ? new Set(args.teamUserIds)
+        : null;
+    const teamSource: "override" | "default" = teamOverride ? "override" : "default";
+
+    // If a team override is in play, re-classify engagement from cached
+    // comments using the override set; otherwise use the pre-computed
+    // engagement on each post (from the listing enrichment).
+    let candidates: Array<NormalizedPost & Partial<EngagementFields>>;
+    if (teamOverride) {
+      const withComments = all.normalized.filter(
+        (p) => !p.commentFetchFailed && p.commentCount > 0,
+      );
+      const recomputed = await mapWithConcurrency(
+        withComments,
+        COMMENTS_CONCURRENCY,
+        async (p) => {
+          try {
+            const comments = await getComments(p.id);
+            const eng = computeEngagementWithTeamOverride(comments, teamOverride);
+            return { p, eng };
+          } catch (err) {
+            console.error(
+              `[featurebase-mcp] stalled-promises: re-classify failed for ${p.slug}:`,
+              err,
+            );
+            return null;
+          }
+        },
+      );
+      candidates = recomputed.filter((x): x is { p: NormalizedPost; eng: EngagementFields } => !!x).map(({ p, eng }) => ({
+        ...p,
+        ...eng,
+      }));
+    } else {
+      candidates = all.normalized.filter((p) => !p.commentFetchFailed);
+    }
+
+    const stalled = candidates.filter((p) => {
       if (!p.adminLastReplyDate || !p.customerLastReplyDate) return false;
       if (p.customerLastReplyDate <= p.adminLastReplyDate) return false;
       return now - new Date(p.adminLastReplyDate).getTime() >= minMs;
     });
-
-    candidates.sort((a, b) =>
+    stalled.sort((a, b) =>
       (b.customerLastReplyDate ?? "").localeCompare(
         a.customerLastReplyDate ?? "",
       ),
     );
 
-    const sliced = candidates.slice(0, limit);
+    const sliced = stalled.slice(0, limit);
 
-    // For each candidate, fetch the full comment thread (cache hit if already
-    // loaded during listing enrichment) to extract the actual messages.
+    // For each candidate, fetch the full comment thread (cache hit if
+    // already loaded during listing enrichment) to extract the actual
+    // messages. If a team override is in play, also re-find the last
+    // admin/customer messages under the override team.
     const enriched = await mapWithConcurrency(
       sliced,
       COMMENTS_CONCURRENCY,
@@ -901,14 +1027,24 @@ export const client = {
         } | null = null;
         try {
           const comments = await getComments(p.id);
-          const lastAdmin = findLastCommentByRole(comments, "admin");
-          const lastCustomer = findLastCommentByRole(comments, "customer");
+          const lastAdmin =
+            teamOverride
+              ? findLastCommentWhere(comments, (c) => teamOverride.has(c.author.userId))
+              : findLastCommentByRole(comments, "admin");
+          const lastCustomer =
+            teamOverride
+              ? findLastCommentWhere(comments, (c) => !teamOverride.has(c.author.userId))
+              : findLastCommentByRole(comments, "customer");
           if (lastAdmin) {
             lastAdminMsg = {
               author: {
                 name: lastAdmin.author.name,
                 userId: lastAdmin.author.userId,
-                role: lastAdmin.author.role,
+                role: teamOverride
+                  ? teamOverride.has(lastAdmin.author.userId)
+                    ? "admin"
+                    : "customer"
+                  : lastAdmin.author.role,
               },
               date: lastAdmin.createdAt,
               excerpt: lastAdmin.bodyText.slice(0, 200),
@@ -919,7 +1055,11 @@ export const client = {
               author: {
                 name: lastCustomer.author.name,
                 userId: lastCustomer.author.userId,
-                role: lastCustomer.author.role,
+                role: teamOverride
+                  ? teamOverride.has(lastCustomer.author.userId)
+                    ? "admin"
+                    : "customer"
+                  : lastCustomer.author.role,
               },
               date: lastCustomer.createdAt,
               excerpt: lastCustomer.bodyText.slice(0, 200),
@@ -954,9 +1094,98 @@ export const client = {
 
     return {
       minDaysSinceAdminReply: minDays,
-      totalCandidates: candidates.length,
+      teamSource,
+      totalCandidates: stalled.length,
       returned: enriched.length,
       promises: enriched,
+    };
+  },
+
+  /**
+   * Look up user IDs by partial name match. Scans post authors (always
+   * available from the listing) plus the comment threads of the N most
+   * recent posts that have any comments (default 5). Each match includes
+   * a `guessedRole`:
+   *   - "admin" if the user never posts but does comment (likely team)
+   *   - "customer" otherwise
+   *
+   * Returns sorted by commentCount desc (the most active commenters
+   * surface first — that's usually your team). Use the returned userIds
+   * as the `teamUserIds` arg to `get_featurebase_stalled_promises` (and
+   * other team-aware tools) so you don't have to set
+   * FEATUREBASE_TEAM_USER_IDS in the env.
+   */
+  async findUser(args: { name: string; sampleSize?: number }) {
+    const all = await getAllPosts();
+    const lower = (args.name ?? "").toLowerCase().trim();
+    if (!lower) return { query: args.name, samplePostsScanned: 0, matches: [] };
+
+    type Match = {
+      userId: string;
+      name: string;
+      postCount: number;
+      commentCount: number;
+      guessedRole: CommentRole;
+    };
+    const matches = new Map<string, Match>();
+
+    // 1. Scan post authors (always available).
+    for (const p of all.normalized) {
+      if (p.author.name.toLowerCase().includes(lower)) {
+        const existing = matches.get(p.author.userId);
+        if (existing) existing.postCount++;
+        else
+          matches.set(p.author.userId, {
+            userId: p.author.userId,
+            name: p.author.name,
+            postCount: 1,
+            commentCount: 0,
+            guessedRole: "customer",
+          });
+      }
+    }
+
+    // 2. Scan comment authors in a sample of recent posts with comments.
+    //    Cached comments make this cheap after first listing miss.
+    const sampleSize = Math.max(0, Math.min(args.sampleSize ?? 5, 20));
+    const samplePosts = all.normalized
+      .filter((p) => p.commentCount > 0)
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .slice(0, sampleSize);
+
+    for (const p of samplePosts) {
+      try {
+        const comments = await getComments(p.id);
+        walkComments(comments, (c) => {
+          if (!c.author.name.toLowerCase().includes(lower)) return;
+          const existing = matches.get(c.author.userId);
+          if (existing) existing.commentCount++;
+          else
+            matches.set(c.author.userId, {
+              userId: c.author.userId,
+              name: c.author.name,
+              postCount: 0,
+              commentCount: 1,
+              // Never posted = likely team. (Customer lurkers are rare.)
+              guessedRole: "admin",
+            });
+        });
+      } catch (err) {
+        console.error(
+          `[featurebase-mcp] find-user: comments fetch failed for ${p.slug}:`,
+          err,
+        );
+      }
+    }
+
+    const out = Array.from(matches.values()).sort(
+      (a, b) =>
+        b.commentCount - a.commentCount || b.postCount - a.postCount,
+    );
+    return {
+      query: args.name,
+      samplePostsScanned: samplePosts.length,
+      matches: out,
     };
   },
 

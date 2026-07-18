@@ -6,7 +6,7 @@ A reverse-engineered Model Context Protocol (MCP) server for the [itsremalt Feat
 
 ## What it does
 
-Six read-only tools:
+Seven read-only tools:
 
 | Tool | Purpose |
 |---|---|
@@ -16,12 +16,13 @@ Six read-only tools:
 | `search_featurebase_posts` | Keyword search over titles + bodies, ranked by relevance |
 | `get_featurebase_stats` | Board-wide aggregates: counts by status, top-voted, most recent |
 | `get_featurebase_stalled_promises` | Find posts where admin replied, customer spoke last, and admin has been silent for N+ days. Surfaces follow-ups you promised but forgot. |
+| `find_featurebase_user` | Look up user IDs by partial name match (post authors + comment authors). Use the returned IDs as `teamUserIds` in stalled-promises so the agent doesn't need the `FEATUREBASE_TEAM_USER_IDS` env var. |
 
 All results are normalized to clean JSON shapes (no HTML in the agent-facing output, just structured data + plain-text excerpts).
 
 ## Known limitations (be honest with your agent)
 
-- **Admin role tagging is best-effort.** Featurebase's `/api/v1/organization.admins` field holds the **org owner**, not the full team that comments on the board. To get accurate `role: "admin"` tagging on comment and post authors, set `FEATUREBASE_TEAM_USER_IDS=id1,id2` (comma-separated user IDs) in the env. Without it, comment authors will usually show `role: "customer"` even if they're your team.
+- **Admin role tagging is best-effort by default.** Featurebase's `/api/v1/organization.admins` field holds the **org owner**, not the full team that comments on the board. To get accurate `role: "admin"` tagging on comment and post authors out-of-the-box, set `FEATUREBASE_TEAM_USER_IDS=id1,id2` (comma-separated user IDs) in the env. Without it, comment authors will usually show `role: "customer"` even if they're your team. To skip env-var configuration, use `find_featurebase_user` at call time and pass the IDs via `teamUserIds` to `get_featurebase_stalled_promises`.
 - **No writes.** Reading only — posting comments, voting, changing status all require authenticated API access, gated to Featurebase's $59/seat/mo Professional plan. Out of scope for a reverse-engineered scraper.
 
 ## What changed: comments + engagement ship
@@ -81,13 +82,26 @@ Returns posts in the order requested. Missing slugs go into `notFound` instead o
 Counts are labeled `*InSnapshot` to make it explicit they're computed over the SSR-bundled subset, not the full board.
 
 ### `get_featurebase_stalled_promises`
-**Args:** `minDaysSinceAdminReply?` (0–365, default 7), `limit?` (1–50, default 20)
+**Args:** `minDaysSinceAdminReply?` (0–365, default 7), `limit?` (1–50, default 20), `teamUserIds?` (string[] — runtime override)
 
-**Returns:** `{ minDaysSinceAdminReply, totalCandidates, returned, promises: StalledPromise[] }`
+**Returns:** `{ minDaysSinceAdminReply, teamSource, totalCandidates, returned, promises: StalledPromise[] }`
+
+`teamSource` is `"override"` when `teamUserIds` was passed (and `FEATUREBASE_TEAM_USER_IDS` env var was bypassed), or `"default"` when env-var-driven. Use this to confirm whether a call used the right team set.
 
 Each `StalledPromise` carries: `slug`, `title`, `url`, `status`, `commentCount`, `upvotes`, `author`, `date`, `adminLastReplyDate`, `customerLastReplyDate`, `daysSinceAdminReply`, `lastAdminMessage` (200-char excerpt + author + date), `lastCustomerMessage` (200-char excerpt + author + date). Sorted by `customerLastReplyDate` desc.
 
-This is the "I said I'd look into it in a comment and forgot to follow up" view. Requires `FEATUREBASE_TEAM_USER_IDS` to be set so admins can be distinguished from customers in the thread — see "Admin role tagging" under Known limitations.
+This is the "I said I'd look into it in a comment and forgot to follow up" view. Two ways to identify admins:
+1. **Auto**: set `FEATUREBASE_TEAM_USER_IDS` env var (recommended for production)
+2. **Self-service**: ask the user for their name, call `find_featurebase_user` to look up the IDs, then pass them as `teamUserIds`
+
+### `find_featurebase_user`
+**Args:** `name` (required, partial match, case-insensitive), `sampleSize?` (0–20, default 5)
+
+**Returns:** `{ query, samplePostsScanned, matches: UserMatch[] }`
+
+Each `UserMatch` carries: `userId`, `name`, `postCount`, `commentCount`, `guessedRole` (`"admin"` if user never posts but does comment, `"customer"` otherwise). Sorted by `commentCount` desc — the most active commenters (likely your team) surface first.
+
+Scans post authors from the listing (always available) plus the comment threads of the N most recent posts with comments (default 5, max 20). Cached comments make this cheap after the first listing miss.
 
 ## Install
 

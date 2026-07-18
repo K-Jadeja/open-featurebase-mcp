@@ -20,11 +20,23 @@ export const GetStalledPromisesArgsSchema = {
     .max(50)
     .default(20)
     .describe("Maximum number of stalled promises to return (1-50). Default: 20."),
+  teamUserIds: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      "Optional override for the team-user-id set. When provided, these " +
+        "IDs are used instead of (or in addition to) the FEATUREBASE_TEAM_USER_IDS " +
+        "env var + /api/v1/organization admins. Use this together with " +
+        "find_featurebase_user to run a stalled-promise query without " +
+        "env-var configuration. Engagement fields are re-computed on the " +
+        "fly from cached comments using this set.",
+    ),
 };
 
 export async function getStalledPromises(args: {
   minDaysSinceAdminReply: number;
   limit: number;
+  teamUserIds?: string[];
 }) {
   const result = await client.getStalledPromises(args);
   return {
