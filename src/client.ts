@@ -337,16 +337,25 @@ async function getAllPosts(): Promise<ListingPayload> {
   // deliberately skip this so the response loudly omits engagement fields
   // instead of computing them against an empty team (which would mark
   // every comment as "customer" — silent corruption).
+  // Always fetch comments for posts that have any — needed for both the
+  // board-wide per-user comment count (used by find_featurebase_user)
+  // AND the engagement-enrichment pass. Engagement CLASSIFICATION only
+  // happens when team is configured, but comment COUNTING happens always.
   const commentCountByUserId = new Map<string, number>();
+  const engagementByPostId = new Map<string, EngagementFields>();
+  const failedPostIds = new Set<string>();
   const rawWithComments = raw.filter((r) => (r.commentCount ?? 0) > 0);
-  if (team.configured && rawWithComments.length > 0) {
+  if (rawWithComments.length > 0) {
     const fetched = await mapWithConcurrency(
       rawWithComments,
       COMMENTS_CONCURRENCY,
       async (r) => {
         try {
           const comments = await getComments(r.id);
-          return { id: r.id, engagement: computeEngagement(comments), comments };
+          const engagement = team.configured
+            ? computeEngagement(comments)
+            : null;
+          return { id: r.id, engagement, comments };
         } catch (err) {
           console.error(
             `[featurebase-mcp] comments fetch failed for ${r.slug}:`,
@@ -356,8 +365,6 @@ async function getAllPosts(): Promise<ListingPayload> {
         }
       },
     );
-    const engagementByPostId = new Map<string, EngagementFields>();
-    const failedPostIds = new Set<string>();
     for (const { id, engagement, comments } of fetched) {
       if (engagement) engagementByPostId.set(id, engagement);
       else failedPostIds.add(id);

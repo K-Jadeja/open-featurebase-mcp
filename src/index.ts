@@ -8,7 +8,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z, ZodErrorMap } from "zod";
+import { z } from "zod";
 
 import { listPosts, ListPostsArgsSchema } from "./tools/list-posts.js";
 import { getPost, GetPostArgsSchema } from "./tools/get-post.js";
@@ -24,52 +24,90 @@ const server = new McpServer({
 });
 
 // ---------------------------------------------------------------------------
-// Global Zod errorMap — produces clean, path-aware error messages for every
-// tool validation. Runs BEFORE the SDK wraps the message into McpError, so
-// the agent sees the formatted text (not Zod's raw issue dump).
+// Clean Zod validation errors via prototype override + path-keyed input cache.
+//
+// Background: when validation fails, Zod throws a ZodError whose `.message`
+// is `JSON.stringify(issues, null, 2)`. The MCP SDK then surfaces that
+// message back to the agent, leaking the entire issues array
+// ([{code, path, inclusive, exact, message, ...}]) along with the useful
+// string. Earlier rounds tried to fix this via a custom global errorMap
+// (formatted each issue's `message` field), but Zod ignores the message
+// reformat for the SDK path because ZodError wraps everything in JSON
+// before the SDK reads it.
+//
+// This patch has two pieces:
+//
+// 1. A global errorMap that captures the failing value (`ctx.data`) into
+//    a path-keyed Map. We can't mutate the issue directly — Zod's
+//    `makeIssue` builds a fresh issue object AFTER errorMap returns and
+//    discards any properties we set. Path is unique enough for our
+//    flat argument shapes; collisions only matter if the same field
+//    triggers multiple error codes, which doesn't happen in practice.
+//
+// 2. A `ZodError.prototype.message` getter override that joins
+//    pre-formatted per-issue messages into one clean line:
+//      "minDaysSinceAdminReply: must be at most 365 (got 9999)"
+//    instead of:
+//      "[ { code: 'too_big', maximum: 365, ... } ]"
+//    `configurable: true` lets us re-define the property; the setter on
+//    the prototype absorbs ZodError's constructor's
+//    `this.message = JSON.stringify(...)` call and discards it.
 // ---------------------------------------------------------------------------
 
-const humanErrorMap: ZodErrorMap = (issue, ctx) => {
+const OrigZodError = z.ZodError;
+
+// Per-issue data captured during validation. Keyed by JSON-stringified path.
+// Cleared on a per-validation basis would be cleaner but adds bookkeeping
+// for negligible benefit — the captured values are only read in the
+// prototype getter that fires when the same process is throwing the same
+// error to the same agent.
+const dataByPath = new Map<string, unknown>();
+
+z.setErrorMap((issue, ctx) => {
+  const path = (issue.path ?? []).join(".") || "(root)";
+  dataByPath.set(path, ctx.data);
+  return { message: issue.message ?? "" };
+});
+
+const formatIssue = (issue: z.ZodIssue): string => {
   const path = (issue.path ?? []).join(".") || "argument";
-  const inputVal = "input" in ctx ? ctx.input : undefined;
+  const inputVal = dataByPath.get(path);
+  const got =
+    inputVal === undefined ? "" : ` (got ${JSON.stringify(inputVal)})`;
 
   switch (issue.code) {
-    case z.ZodIssueCode.too_big: {
-      const bound = issue.maximum;
-      const got = inputVal === undefined ? "" : ` (got ${JSON.stringify(inputVal)})`;
-      return {
-        message: `${path}: must be at most ${bound}${issue.inclusive ? "" : " (exclusive)"}${got}`,
-      };
-    }
-    case z.ZodIssueCode.too_small: {
-      const bound = issue.minimum;
-      const got = inputVal === undefined ? "" : ` (got ${JSON.stringify(inputVal)})`;
-      return {
-        message: `${path}: must be at least ${bound}${issue.inclusive ? "" : " (exclusive)"}${got}`,
-      };
-    }
-    case z.ZodIssueCode.invalid_type:
-      return {
-        message: `${path}: expected ${issue.expected}, received ${issue.received}`,
-      };
-    case z.ZodIssueCode.invalid_enum_value:
-      return {
-        message: `${path}: must be one of ${issue.options.join(", ")}`,
-      };
-    case z.ZodIssueCode.invalid_string:
-      return { message: `${path}: ${issue.validation}` };
-    case z.ZodIssueCode.unrecognized_keys:
-      return {
-        message: `${path}: unrecognized keys ${JSON.stringify(issue.keys)}`,
-      };
+    case "too_big":
+      return `${path}: must be at most ${issue.maximum}${
+        issue.inclusive ? "" : " (exclusive)"
+      }${got}`;
+    case "too_small":
+      return `${path}: must be at least ${issue.minimum}${
+        issue.inclusive ? "" : " (exclusive)"
+      }${got}`;
+    case "invalid_type":
+      return `${path}: expected ${issue.expected}, received ${issue.received}`;
+    case "invalid_enum_value":
+      return `${path}: must be one of ${(issue.options ?? []).join(", ")}`;
+    case "invalid_string":
+      return `${path}: ${issue.validation ?? "invalid string"}`;
+    case "unrecognized_keys":
+      return `${path}: unrecognized keys ${JSON.stringify(issue.keys ?? [])}`;
     default:
-      return {
-        message: `${path}: ${issue.message ?? "invalid"}`,
-      };
+      return `${path}: ${issue.message ?? "invalid"}`;
   }
 };
 
-z.setErrorMap(humanErrorMap);
+Object.defineProperty(OrigZodError.prototype, "message", {
+  get(this: z.ZodError) {
+    if (!this.issues || this.issues.length === 0) return "";
+    return this.issues.map(formatIssue).join("; ");
+  },
+  set(_value: unknown) {
+    // Absorb constructor's `this.message = JSON.stringify(...)` and let our
+    // getter do all formatting.
+  },
+  configurable: true,
+});
 
 server.tool(
   "list_featurebase_posts",

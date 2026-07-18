@@ -25,9 +25,9 @@ All results are normalized to clean JSON shapes (no HTML in the agent-facing out
 - **Admin role tagging is opt-in.** `/api/v1/organization.admins` only holds the org owner (not the team that comments), so the MCP deliberately doesn't use it as a team source. To get accurate `role: "admin"` tagging on comment and post authors, set `FEATUREBASE_TEAM_USER_IDS=id1,id2` in the env, or pass `teamUserIds` per-call to `get_featurebase_stalled_promises` after calling `find_featurebase_user`. Without one of these, every author shows `role: "unknown"` and engagement fields (`hasAdminReply`, etc.) are **omitted entirely** from `NormalizedPost` — the loud-failure contract. Silent wrong data ("customer" by default) was the most dangerous failure mode and is no longer possible.
 - **No writes.** Reading only — posting comments, voting, changing status all require authenticated API access, gated to Featurebase's $59/seat/mo Professional plan. Out of scope for a reverse-engineered scraper.
 
-## What changed: validation errors are now path-aware
+## What changed: validation errors are clean and complete
 
-Earlier the MCP leaked Zod's raw issue dump into MCP error responses when callers passed out-of-range arguments (e.g. `minDaysSinceAdminReply: 9999`). The SDK's `Input validation error: Invalid arguments for tool name: [ { code: 'too_big', ... } ]` exposed internal schema shape. A global Zod errorMap now formats every issue as `path: must be at most N (got V)` before the SDK wraps it, so callers get `minDaysSinceAdminReply: must be at most 365 (got 9999)` instead.
+Earlier the MCP leaked Zod's raw issue dump into MCP error responses when callers passed out-of-range arguments (e.g. `minDaysSinceAdminReply: 9999`). The SDK wrapped `[ { code: 'too_big', maximum: 365, type: 'number', inclusive: true, exact: false, message: ..., path: [...] } ]` before re-emitting it. A round-3 patch redefines `ZodError.prototype.message` as a getter that emits a clean one-line summary: `minDaysSinceAdminReply: must be at most 365 (got 9999)`. Captures the failing value via a path-keyed Map populated from the Zod errorMap's `ctx.data`. The audit asked for "one line, nothing else" — that's what's now produced.
 
 ## What changed: comments + engagement ship
 
@@ -176,7 +176,7 @@ Changes require a server restart.
 4. All pages are concatenated into a single in-memory snapshot, normalized (HTML stripped, fields flattened), and cached for 5 minutes.
 5. Filter/sort happen client-side so the cache stays valid across all sort orders and filter combinations.
 6. When `get_featurebase_post(include_comments=true)` is called, `/api/v1/comment?submissionId=<id>` fetches the comment thread (top-level comments only — nested replies ship inside each comment's `replies` array). Tree is preserved server-side; we just normalize authors + sort by `createdAt`. Cached 5 min per submission.
-7. During listing enrichment, comments are fetched once per post that has any (concurrency capped at 8, allSettled inside) and engagement metadata is computed and merged onto each post in `posts[]`. Skipped entirely if the team is not configured. Per-post failures set `commentFetchFailed: true` rather than failing the whole listing.
+7. During listing enrichment, comments are fetched once per post that has any (concurrency capped at 8, allSettled inside). Engagement classification is computed and merged onto each post in `posts[]` only when team IDs are configured; otherwise engagement fields are omitted (loud failure). The same fetched comments also populate a board-wide `commentCountByUserId` index so `find_featurebase_user` can return `totalCommentCount` regardless of whether the team is configured. Per-post fetch failures set `commentFetchFailed: true` rather than failing the whole listing.
 8. No DOM scraping, no cheerio, no HTML parsing — JSON throughout.
 
 ## Troubleshooting
