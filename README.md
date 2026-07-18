@@ -23,6 +23,13 @@ All results are normalized to clean JSON shapes (no HTML in the agent-facing out
 - **Admin role tagging is best-effort.** Featurebase's `/api/v1/organization.admins` field holds the **org owner**, not the full team that comments on the board. To get accurate `role: "admin"` tagging on comment and post authors, set `FEATUREBASE_TEAM_USER_IDS=id1,id2` (comma-separated user IDs) in the env. Without it, comment authors will usually show `role: "customer"` even if they're your team.
 - **No writes.** Reading only — posting comments, voting, changing status all require authenticated API access, gated to Featurebase's $59/seat/mo Professional plan. Out of scope for a reverse-engineered scraper.
 
+## What changed: comments + engagement ship
+
+Two earlier limitations are now closed:
+
+1. **Comment threads are accessible.** The post-detail pages render as Next.js 404 shells, but the SPA's client components call `/api/v1/comment?submissionId=<id>` directly — no auth required. `get_featurebase_post(include_comments=true)` returns the full threaded tree.
+2. **Engagement metadata is enriched on listing.** Each post in `list`/`search`/`get_batch` now carries `hasAdminReply`, `adminReplyCount`, `customerCommentCount`, `lastCommentDate`, `adminLastReplyDate`, `customerLastReplyDate`, plus a `commentFetchFailed` flag for partial failures. Costs one comment fetch per post-with-comments on first listing miss, then zero until the 5-min cache expires.
+
 ## What changed: pagination ships
 
 Earlier versions of this MCP were limited to the ~20 posts the SSR `__NEXT_DATA__` payload bundled. Reverse-engineering the SPA's axios config revealed the baseURL is `/api`, exposing the public listing endpoint at `/api/v1/submission?page=N` — no auth, no CSRF, returns JSON directly. The MCP now fetches all pages in parallel and merges them into a single cached snapshot. For itsremalt that's all **56 of 56 posts** across **6 pages**, with the full snapshot window (e.g. 2025-12-13 → 2026-07-14) visible in `get_stats`.
@@ -35,6 +42,8 @@ Earlier versions of this MCP were limited to the ~20 posts the SSR `__NEXT_DATA_
 **Returns:** `{ totalResults, availableResults, truncated, returned, posts: NormalizedPost[] }`
 
 The `truncated` flag tells you when the SSR snapshot doesn't cover the full board.
+
+Each post in `posts[]` carries engagement metadata: `hasAdminReply`, `adminReplyCount`, `customerCommentCount`, `lastCommentDate`, `adminLastReplyDate`, `customerLastReplyDate`, and `commentFetchFailed` (only set when the comments fetch failed for that post). The enrichment is eager — every post with `commentCount > 0` has its comment thread fetched once during listing, with concurrency capped at 8 to avoid hammering the API. On a 56-post board with 33 having comments, this costs ~33 comment fetches on first listing miss and zero on cache hits.
 
 ### `get_featurebase_post`
 **Args:** `slug` (required), `include_comments?` (default `false`)
@@ -124,7 +133,8 @@ Changes require a server restart.
 4. All pages are concatenated into a single in-memory snapshot, normalized (HTML stripped, fields flattened), and cached for 5 minutes.
 5. Filter/sort happen client-side so the cache stays valid across all sort orders and filter combinations.
 6. When `get_featurebase_post(include_comments=true)` is called, `/api/v1/comment?submissionId=<id>` fetches the comment thread (top-level comments only — nested replies ship inside each comment's `replies` array). Tree is preserved server-side; we just normalize authors + sort by `createdAt`. Cached 5 min per submission.
-7. No DOM scraping, no cheerio, no HTML parsing — JSON throughout.
+7. During listing enrichment, comments are fetched once per post that has any (concurrency capped at 8, allSettled inside) and engagement metadata is computed and merged onto each post in `posts[]`. Per-post failures set `commentFetchFailed: true` rather than failing the whole listing.
+8. No DOM scraping, no cheerio, no HTML parsing — JSON throughout.
 
 ## Troubleshooting
 

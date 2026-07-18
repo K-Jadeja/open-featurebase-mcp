@@ -178,6 +178,11 @@ function normalizePost(
     author: enrichAuthor(normalizeAuthorBasic(raw.user), orgAdminIds),
     date: raw.date ?? "",
     category: normalizeCategory(raw.postCategory),
+    // Engagement defaults — overwritten in getAllPosts when comments are
+    // successfully fetched for this post.
+    hasAdminReply: false,
+    adminReplyCount: 0,
+    customerCommentCount: 0,
   };
 }
 
@@ -292,6 +297,42 @@ async function getAllPosts(): Promise<ListingPayload> {
 
   const raw = successfulPages.flatMap((p) => p.results);
   const normalized = raw.map((r) => normalizePost(r, orgAdminIds));
+
+  // Engagement enrichment: fetch comment threads for posts that have any.
+  // Concurrency capped at 8; per-post failures degrade gracefully (the
+  // post keeps its commentCount from the listing, engagement fields stay
+  // at defaults, commentFetchFailed=true flags the gap).
+  const rawWithComments = raw.filter((r) => (r.commentCount ?? 0) > 0);
+  if (rawWithComments.length > 0) {
+    const fetched = await mapWithConcurrency(
+      rawWithComments,
+      COMMENTS_CONCURRENCY,
+      async (r) => {
+        try {
+          const comments = await getComments(r.id);
+          return { id: r.id, engagement: computeEngagement(comments) };
+        } catch (err) {
+          console.error(
+            `[featurebase-mcp] comments fetch failed for ${r.slug}:`,
+            err,
+          );
+          return { id: r.id, engagement: null };
+        }
+      },
+    );
+    const engagementByPostId = new Map<string, EngagementFields>();
+    const failedPostIds = new Set<string>();
+    for (const { id, engagement } of fetched) {
+      if (engagement) engagementByPostId.set(id, engagement);
+      else failedPostIds.add(id);
+    }
+    for (const post of normalized) {
+      const eng = engagementByPostId.get(post.id);
+      if (eng) Object.assign(post, eng);
+      else if (failedPostIds.has(post.id)) post.commentFetchFailed = true;
+    }
+  }
+
   const out: ListingPayload = {
     raw,
     normalized,
@@ -473,6 +514,89 @@ async function getComments(submissionId: string): Promise<NormalizedComment[]> {
   cacheSet(cacheKey, tree, TTL.comments);
   return tree;
 }
+
+// ---------------------------------------------------------------------------
+// Engagement enrichment
+//
+// For each post with commentCount > 0, walk its comment thread once and
+// produce engagement metadata. Used to surface "team has replied", "last
+// admin reply is older than last customer comment", etc., on the listing
+// without forcing agents to fetch each post in detail.
+// ---------------------------------------------------------------------------
+
+interface EngagementFields {
+  hasAdminReply: boolean;
+  adminReplyCount: number;
+  customerCommentCount: number;
+  lastCommentDate?: string;
+  adminLastReplyDate?: string;
+  customerLastReplyDate?: string;
+}
+
+function computeEngagement(comments: NormalizedComment[]): EngagementFields {
+  let hasAdminReply = false;
+  let adminReplyCount = 0;
+  let customerCommentCount = 0;
+  let lastCommentDate: string | undefined;
+  let adminLastReplyDate: string | undefined;
+  let customerLastReplyDate: string | undefined;
+
+  function walk(comment: NormalizedComment): void {
+    if (!lastCommentDate || comment.createdAt > lastCommentDate) {
+      lastCommentDate = comment.createdAt;
+    }
+    if (comment.author.role === "admin") {
+      hasAdminReply = true;
+      adminReplyCount++;
+      if (!adminLastReplyDate || comment.createdAt > adminLastReplyDate) {
+        adminLastReplyDate = comment.createdAt;
+      }
+    } else {
+      customerCommentCount++;
+      if (!customerLastReplyDate || comment.createdAt > customerLastReplyDate) {
+        customerLastReplyDate = comment.createdAt;
+      }
+    }
+    for (const reply of comment.replies) walk(reply);
+  }
+
+  for (const c of comments) walk(c);
+  return {
+    hasAdminReply,
+    adminReplyCount,
+    customerCommentCount,
+    lastCommentDate,
+    adminLastReplyDate,
+    customerLastReplyDate,
+  };
+}
+
+/**
+ * Promise.all with a concurrency cap. `fn` is invoked sequentially within
+ * each worker; workers run in parallel. Used to fetch comment threads for
+ * every post that has any comments without hammering the API.
+ */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  async function worker(): Promise<void> {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, () => worker()),
+  );
+  return results;
+}
+
+/** Max parallel comment fetches during listing enrichment. */
+const COMMENTS_CONCURRENCY = 8;
 
 // ---------------------------------------------------------------------------
 // Public client surface

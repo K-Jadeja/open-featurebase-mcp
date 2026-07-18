@@ -49,6 +49,33 @@ export interface NormalizedPost {
   author: NormalizedAuthor;
   date: string; // ISO
   category: string; // "Feature Request", "Bug", etc.
+
+  // -----------------------------------------------------------------------
+  // Engagement metadata — populated when comments were successfully fetched.
+  // For posts with commentCount === 0 these default to 0/false and the date
+  // fields stay undefined. For posts with commentCount > 0 where the
+  // comments fetch failed, the counts stay 0/false and the dates undefined;
+  // `commentFetchFailed` is set to true.
+  // -----------------------------------------------------------------------
+
+  /** True if any comment in the thread was authored by an admin. */
+  hasAdminReply: boolean;
+  /** Number of comments authored by admins (across the whole thread). */
+  adminReplyCount: number;
+  /** Number of comments authored by customers (across the whole thread). */
+  customerCommentCount: number;
+  /** ISO timestamp of the most recent comment (any author). */
+  lastCommentDate?: string;
+  /** ISO timestamp of the most recent admin comment. Undefined if no admin reply. */
+  adminLastReplyDate?: string;
+  /** ISO timestamp of the most recent customer comment. */
+  customerLastReplyDate?: string;
+  /**
+   * True only when the comments fetch failed and the engagement fields are
+   * therefore not reliable for this post. Listing returns the post anyway
+   * (with commentCount from the listing payload) so agents can still see it.
+   */
+  commentFetchFailed?: boolean;
 }
 
 export interface NormalizedComment {
