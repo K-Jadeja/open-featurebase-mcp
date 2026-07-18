@@ -4,8 +4,19 @@
  * where the agent might want it.
  */
 
-/** Role of an author on this Featurebase board. */
-export type CommentRole = "admin" | "customer";
+/**
+ * Role of an author on this Featurebase board.
+ *
+ * - "admin" — userId is in the configured team set (env var +
+ *   /api/v1/organization admins)
+ * - "customer" — team set is configured but this user is not in it
+ * - "unknown" — no team set is configured at all (we cannot tell)
+ *
+ * When role is "unknown", engagement fields (hasAdminReply, etc.) are
+ * omitted from `NormalizedPost` rather than set to false/0 — silent
+ * false values have been the most dangerous failure mode here.
+ */
+export type CommentRole = "admin" | "customer" | "unknown";
 
 /**
  * Author identity, enriched with board role. Both post and comment authors
@@ -19,12 +30,9 @@ export interface NormalizedAuthor {
   /** Featurebase's internal user ID. Use for cross-referencing the team set. */
   userId: string;
   /**
-   * "admin" if the userId is in the org's admin set or the
-   * FEATUREBASE_TEAM_USER_IDS env var; "customer" otherwise.
-   *
-   * Note: `/api/v1/organization`'s `admins` field is the org OWNER, not the
-   * full team that comments on the board. To get the comment-author team
-   * tagged correctly, set `FEATUREBASE_TEAM_USER_IDS=id1,id2` in the env.
+   * See `CommentRole`. Set to "unknown" when no team IDs are configured —
+   * the agent should treat "unknown" as "data is unreliable, call
+   * find_featurebase_user or set FEATUREBASE_TEAM_USER_IDS to fix this."
    */
   role: CommentRole;
 }
@@ -51,29 +59,35 @@ export interface NormalizedPost {
   category: string; // "Feature Request", "Bug", etc.
 
   // -----------------------------------------------------------------------
-  // Engagement metadata — populated when comments were successfully fetched.
-  // For posts with commentCount === 0 these default to 0/false and the date
-  // fields stay undefined. For posts with commentCount > 0 where the
-  // comments fetch failed, the counts stay 0/false and the dates undefined;
-  // `commentFetchFailed` is set to true.
+  // Engagement metadata — populated ONLY when (a) the post has comments
+  // AND (b) comments were successfully fetched AND (c) team IDs are
+  // configured. Otherwise these fields are OMITTED (not set to false/0),
+  // which is the loud-failure contract for the "no team IDs available"
+  // silent-data-corruption bug.
+  //
+  // When omitted, the agent should assume engagement is unreliable and
+  // either (1) call `find_featurebase_user` to look up team IDs, then
+  // pass them via `teamUserIds` to engagement-bearing tools, or (2) read
+  // the thread directly via `get_featurebase_post(slug, include_comments=true)`.
   // -----------------------------------------------------------------------
 
-  /** True if any comment in the thread was authored by an admin. */
-  hasAdminReply: boolean;
-  /** Number of comments authored by admins (across the whole thread). */
-  adminReplyCount: number;
-  /** Number of comments authored by customers (across the whole thread). */
-  customerCommentCount: number;
-  /** ISO timestamp of the most recent comment (any author). */
+  /** True if any comment in the thread was authored by an admin. Omitted when not classified. */
+  hasAdminReply?: boolean;
+  /** Number of comments authored by admins (across the whole thread). Omitted when not classified. */
+  adminReplyCount?: number;
+  /** Number of comments authored by customers (across the whole thread). Omitted when not classified. */
+  customerCommentCount?: number;
+  /** ISO timestamp of the most recent comment (any author). Omitted when not classified. */
   lastCommentDate?: string;
-  /** ISO timestamp of the most recent admin comment. Undefined if no admin reply. */
+  /** ISO timestamp of the most recent admin comment. Omitted when not classified or no admin reply. */
   adminLastReplyDate?: string;
-  /** ISO timestamp of the most recent customer comment. */
+  /** ISO timestamp of the most recent customer comment. Omitted when not classified. */
   customerLastReplyDate?: string;
   /**
-   * True only when the comments fetch failed and the engagement fields are
-   * therefore not reliable for this post. Listing returns the post anyway
-   * (with commentCount from the listing payload) so agents can still see it.
+   * True only when the comments fetch failed. Listing returns the post
+   * anyway (with commentCount from the listing payload) so agents can
+   * still see it; this flag tells the agent engagement fields aren't
+   * reliable for this specific post.
    */
   commentFetchFailed?: boolean;
 }

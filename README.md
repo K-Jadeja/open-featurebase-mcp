@@ -22,7 +22,7 @@ All results are normalized to clean JSON shapes (no HTML in the agent-facing out
 
 ## Known limitations (be honest with your agent)
 
-- **Admin role tagging is best-effort by default.** Featurebase's `/api/v1/organization.admins` field holds the **org owner**, not the full team that comments on the board. To get accurate `role: "admin"` tagging on comment and post authors out-of-the-box, set `FEATUREBASE_TEAM_USER_IDS=id1,id2` (comma-separated user IDs) in the env. Without it, comment authors will usually show `role: "customer"` even if they're your team. To skip env-var configuration, use `find_featurebase_user` at call time and pass the IDs via `teamUserIds` to `get_featurebase_stalled_promises`.
+- **Admin role tagging is opt-in.** `/api/v1/organization.admins` only holds the org owner (not the team that comments), so the MCP deliberately doesn't use it as a team source. To get accurate `role: "admin"` tagging on comment and post authors, set `FEATUREBASE_TEAM_USER_IDS=id1,id2` in the env, or pass `teamUserIds` per-call to `get_featurebase_stalled_promises` after calling `find_featurebase_user`. Without one of these, every author shows `role: "unknown"` and engagement fields (`hasAdminReply`, etc.) are **omitted entirely** from `NormalizedPost` — the loud-failure contract. Silent wrong data ("customer" by default) was the most dangerous failure mode and is no longer possible.
 - **No writes.** Reading only — posting comments, voting, changing status all require authenticated API access, gated to Featurebase's $59/seat/mo Professional plan. Out of scope for a reverse-engineered scraper.
 
 ## What changed: comments + engagement ship
@@ -84,9 +84,13 @@ Counts are labeled `*InSnapshot` to make it explicit they're computed over the S
 ### `get_featurebase_stalled_promises`
 **Args:** `minDaysSinceAdminReply?` (0–365, default 7), `limit?` (1–50, default 20), `teamUserIds?` (string[] — runtime override)
 
-**Returns:** `{ minDaysSinceAdminReply, teamSource, totalCandidates, returned, promises: StalledPromise[] }`
+**Returns:** `{ minDaysSinceAdminReply, teamSource, warning?, unusedTeamUserIds?, totalCandidates, returned, promises: StalledPromise[] }`
 
 `teamSource` is `"override"` when `teamUserIds` was passed (and `FEATUREBASE_TEAM_USER_IDS` env var was bypassed), or `"default"` when env-var-driven. Use this to confirm whether a call used the right team set.
+
+`warning` is set when `teamSource === "default"` AND no team IDs are configured — the response is empty (`totalCandidates: 0`) because engagement can't be classified. The warning tells the agent to call `find_featurebase_user` or set the env var.
+
+`unusedTeamUserIds` is set when `teamUserIds` was passed with at least one ID that didn't appear in any comment thread. Could be a fake ID, or a real user who just never commented. Helps the agent catch config typos.
 
 Each `StalledPromise` carries: `slug`, `title`, `url`, `status`, `commentCount`, `upvotes`, `author`, `date`, `adminLastReplyDate`, `customerLastReplyDate`, `daysSinceAdminReply`, `lastAdminMessage` (200-char excerpt + author + date), `lastCustomerMessage` (200-char excerpt + author + date). Sorted by `customerLastReplyDate` desc.
 
@@ -145,7 +149,7 @@ npm run dev
 | Env var | Default | Purpose |
 |---|---|---|
 | `FEATUREBASE_BOARD_URL` | `https://itsremalt.featurebase.app` | Point at a different public Featurebase board |
-| `FEATUREBASE_TEAM_USER_IDS` | (unset) | Comma-separated Featurebase user IDs considered team/admins. Combined with `/api/v1/organization.admins` for role tagging on comment + post authors. |
+| `FEATUREBASE_TEAM_USER_IDS` | (unset) | Comma-separated Featurebase user IDs considered team/admins. The sole source for role tagging — `/api/v1/organization.admins` is intentionally not used (it holds the org owner, not the comment team). |
 
 Changes require a server restart.
 
@@ -153,11 +157,11 @@ Changes require a server restart.
 
 1. `GET {BASE_URL}/api/v1/submission?sortBy=date:desc&inReview=false&includePinned=true&page=N` returns JSON directly (the SPA's axios baseURL is `/api`).
 2. First call to page 1 discovers `totalPages` + `totalResults`. Remaining pages are fetched in parallel via `Promise.allSettled` so a single failed page doesn't take down the whole listing.
-3. `/api/v1/organization` is fetched in parallel with the listing to enrich each post's author with a `role` tag. Cached 1 hour.
+3. Role tagging uses ONLY `FEATUREBASE_TEAM_USER_IDS` env var — `/api/v1/organization.admins` is deliberately ignored because it holds the org owner, not the team. When the env var is empty, every author is `role: "unknown"` and engagement fields are omitted from listing responses.
 4. All pages are concatenated into a single in-memory snapshot, normalized (HTML stripped, fields flattened), and cached for 5 minutes.
 5. Filter/sort happen client-side so the cache stays valid across all sort orders and filter combinations.
 6. When `get_featurebase_post(include_comments=true)` is called, `/api/v1/comment?submissionId=<id>` fetches the comment thread (top-level comments only — nested replies ship inside each comment's `replies` array). Tree is preserved server-side; we just normalize authors + sort by `createdAt`. Cached 5 min per submission.
-7. During listing enrichment, comments are fetched once per post that has any (concurrency capped at 8, allSettled inside) and engagement metadata is computed and merged onto each post in `posts[]`. Per-post failures set `commentFetchFailed: true` rather than failing the whole listing.
+7. During listing enrichment, comments are fetched once per post that has any (concurrency capped at 8, allSettled inside) and engagement metadata is computed and merged onto each post in `posts[]`. Skipped entirely if the team is not configured. Per-post failures set `commentFetchFailed: true` rather than failing the whole listing.
 8. No DOM scraping, no cheerio, no HTML parsing — JSON throughout.
 
 ## Troubleshooting
@@ -177,8 +181,8 @@ Means one or more pages failed to fetch — partial snapshot. Use `snapshotSize`
 **Comments fetch fails**
 `get_featurebase_post` will still return the post; check `commentsError` for the reason. Common causes: `submissionId` missing on the post (shouldn't happen with current listing payloads), network error, or the comment endpoint returning an unexpected shape. Restart retries.
 
-**All comment authors show `role: "customer"`**
-The team's user IDs aren't in `/api/v1/organization.admins` (Featurebase stores the org owner there, not your comment-reply team). Set `FEATUREBASE_TEAM_USER_IDS=id1,id2` in the env to override. IDs are visible in any comment's `author.userId`.
+**All comment authors show `role: "unknown"` and engagement fields are missing**
+The MCP deliberately doesn't trust `/api/v1/organization.admins` (it holds the org owner, not your comment-reply team). To activate role tagging, either set `FEATUREBASE_TEAM_USER_IDS=id1,id2` in the env, or call `find_featurebase_user` to discover IDs and pass them via `teamUserIds` to `get_featurebase_stalled_promises`.
 
 ## License
 

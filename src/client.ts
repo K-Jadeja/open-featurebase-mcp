@@ -134,18 +134,46 @@ function normalizeAuthorBasic(raw: any): Omit<NormalizedAuthor, "role"> {
 }
 
 /**
- * Decide role for an author by user ID. "admin" if userId is in the org
- * admin set (cached) or the FEATUREBASE_TEAM_USER_IDS env var; "customer"
- * otherwise.
+ * Effective team set for this MCP run. Defaults to ONLY the
+ * `FEATUREBASE_TEAM_USER_IDS` env var.
+ *
+ * We deliberately do NOT include `/api/v1/organization.admins` — that field
+ * holds the org OWNER, not the team that comments on the board. Including
+ * it would make the team set look "configured" (non-empty) while classifying
+ * actual team comments as `role: "customer"`. Use the env var for correct
+ * role tagging, or pass `teamUserIds` per-call to engagement-bearing tools
+ * after calling `find_featurebase_user`.
+ *
+ * `configured: false` ⇒ role tagging skipped, engagement fields omitted.
+ */
+async function getEffectiveTeamSet(): Promise<{
+  set: ReadonlySet<string>;
+  configured: boolean;
+}> {
+  return { set: TEAM_USER_IDS, configured: TEAM_USER_IDS.size > 0 };
+}
+
+/**
+ * Decide role for an author by user ID.
+ * - "admin" if team is configured AND userId is in the set
+ * - "customer" if team is configured but userId is not in the set
+ * - "unknown" if no team is configured at all (we cannot tell)
+ *
+ * The "unknown" path is the loud-failure contract: rather than lie with
+ * "customer" when we have no basis for classification, we expose the gap.
  */
 function enrichAuthor(
   base: Omit<NormalizedAuthor, "role">,
-  orgAdminIds: ReadonlySet<string>,
+  team: { set: ReadonlySet<string>; configured: boolean },
 ): NormalizedAuthor {
-  const role: CommentRole =
-    TEAM_USER_IDS.has(base.userId) || orgAdminIds.has(base.userId)
-      ? "admin"
-      : "customer";
+  let role: CommentRole;
+  if (!team.configured) {
+    role = "unknown";
+  } else if (team.set.has(base.userId)) {
+    role = "admin";
+  } else {
+    role = "customer";
+  }
   return { ...base, role };
 }
 
@@ -159,7 +187,7 @@ function normalizeCategory(raw: any): string {
 
 function normalizePost(
   raw: any,
-  orgAdminIds: ReadonlySet<string>,
+  team: { set: ReadonlySet<string>; configured: boolean },
 ): NormalizedPost {
   const fullText = htmlToText(raw.content ?? "");
   const EXCERPT_LIMIT = 800;
@@ -175,24 +203,22 @@ function normalizePost(
     status: normalizeStatus(raw.postStatus),
     upvotes: raw.upvotes ?? 0,
     commentCount: raw.commentCount ?? 0,
-    author: enrichAuthor(normalizeAuthorBasic(raw.user), orgAdminIds),
+    author: enrichAuthor(normalizeAuthorBasic(raw.user), team),
     date: raw.date ?? "",
     category: normalizeCategory(raw.postCategory),
-    // Engagement defaults — overwritten in getAllPosts when comments are
-    // successfully fetched for this post.
-    hasAdminReply: false,
-    adminReplyCount: 0,
-    customerCommentCount: 0,
+    // Engagement fields are NOT initialized here — getAllPosts merges them
+    // in only when (a) the team is configured and (b) comments fetch
+    // succeeds. Omission is the loud-failure contract for "no team IDs."
   };
 }
 
 function normalizeComment(
   raw: any,
-  orgAdminIds: ReadonlySet<string>,
+  team: { set: ReadonlySet<string>; configured: boolean },
 ): NormalizedComment {
   return {
     id: raw.id,
-    author: enrichAuthor(normalizeAuthorBasic(raw.user), orgAdminIds),
+    author: enrichAuthor(normalizeAuthorBasic(raw.user), team),
     bodyHtml: raw.content ?? "",
     bodyText: htmlToText(raw.content ?? ""),
     createdAt: raw.createdAt ?? "",
@@ -200,7 +226,7 @@ function normalizeComment(
     upvotes: raw.upvotes ?? 0,
     parentId: raw.parentComment ?? null,
     replies: Array.isArray(raw.replies)
-      ? raw.replies.map((r: any) => normalizeComment(r, orgAdminIds))
+      ? raw.replies.map((r: any) => normalizeComment(r, team))
       : [],
   };
 }
@@ -274,11 +300,11 @@ async function getAllPosts(): Promise<ListingPayload> {
   if (cached) return cached;
 
   // Fetch page 1 + org admin set in parallel. Both are needed to build the
-  // listing payload: page 1 discovers totalPages, the org set enriches each
-  // post's author with a role tag.
-  const [first, orgAdminIds] = await Promise.all([
+  // listing payload: page 1 discovers totalPages, the org set combines
+  // with FEATUREBASE_TEAM_USER_IDS to form the team set for role tagging.
+  const [first, team] = await Promise.all([
     fetchApiPage(1),
-    getOrgAdminIds(),
+    getEffectiveTeamSet(),
   ]);
   const totalPages = first.totalPages;
   const totalResults = first.totalResults;
@@ -296,40 +322,44 @@ async function getAllPosts(): Promise<ListingPayload> {
   }
 
   const raw = successfulPages.flatMap((p) => p.results);
-  const normalized = raw.map((r) => normalizePost(r, orgAdminIds));
+  const normalized = raw.map((r) => normalizePost(r, team));
 
-  // Engagement enrichment: fetch comment threads for posts that have any.
-  // Concurrency capped at 8; per-post failures degrade gracefully (the
-  // post keeps its commentCount from the listing, engagement fields stay
-  // at defaults, commentFetchFailed=true flags the gap).
-  const rawWithComments = raw.filter((r) => (r.commentCount ?? 0) > 0);
-  if (rawWithComments.length > 0) {
-    const fetched = await mapWithConcurrency(
-      rawWithComments,
-      COMMENTS_CONCURRENCY,
-      async (r) => {
-        try {
-          const comments = await getComments(r.id);
-          return { id: r.id, engagement: computeEngagement(comments) };
-        } catch (err) {
-          console.error(
-            `[featurebase-mcp] comments fetch failed for ${r.slug}:`,
-            err,
-          );
-          return { id: r.id, engagement: null };
-        }
-      },
-    );
-    const engagementByPostId = new Map<string, EngagementFields>();
-    const failedPostIds = new Set<string>();
-    for (const { id, engagement } of fetched) {
-      if (engagement) engagementByPostId.set(id, engagement);
-      else failedPostIds.add(id);
-    }
-    for (const post of normalized) {
-      const eng = engagementByPostId.get(post.id);
-      if (eng) Object.assign(post, eng);
-      else if (failedPostIds.has(post.id)) post.commentFetchFailed = true;
+  // Engagement enrichment ONLY when (a) team is configured and (b) the
+  // post has comments. Per-post failures set commentFetchFailed rather
+  // than failing the whole listing. When team is not configured we
+  // deliberately skip this so the response loudly omits engagement fields
+  // instead of computing them against an empty team (which would mark
+  // every comment as "customer" — silent corruption).
+  if (team.configured) {
+    const rawWithComments = raw.filter((r) => (r.commentCount ?? 0) > 0);
+    if (rawWithComments.length > 0) {
+      const fetched = await mapWithConcurrency(
+        rawWithComments,
+        COMMENTS_CONCURRENCY,
+        async (r) => {
+          try {
+            const comments = await getComments(r.id);
+            return { id: r.id, engagement: computeEngagement(comments) };
+          } catch (err) {
+            console.error(
+              `[featurebase-mcp] comments fetch failed for ${r.slug}:`,
+              err,
+            );
+            return { id: r.id, engagement: null };
+          }
+        },
+      );
+      const engagementByPostId = new Map<string, EngagementFields>();
+      const failedPostIds = new Set<string>();
+      for (const { id, engagement } of fetched) {
+        if (engagement) engagementByPostId.set(id, engagement);
+        else failedPostIds.add(id);
+      }
+      for (const post of normalized) {
+        const eng = engagementByPostId.get(post.id);
+        if (eng) Object.assign(post, eng);
+        else if (failedPostIds.has(post.id)) post.commentFetchFailed = true;
+      }
     }
   }
 
@@ -481,7 +511,7 @@ async function getComments(submissionId: string): Promise<NormalizedComment[]> {
   const cached = cacheGet<NormalizedComment[]>(cacheKey);
   if (cached) return cached;
 
-  const orgAdminIds = await getOrgAdminIds();
+  const team = await getEffectiveTeamSet();
 
   const first = await fetchCommentsPage(submissionId, 1);
   const totalPages = first.totalPages;
@@ -499,9 +529,10 @@ async function getComments(submissionId: string): Promise<NormalizedComment[]> {
 
   // The server nests replies inside each top-level comment's `replies`
   // array; the flat `results` array contains only top-level comments when
-  // pagination > 1. We pass orgAdminIds into the recursive normalizer so
-  // every nested reply's author gets a role tag.
-  const tree = allRaw.map((r) => normalizeComment(r, orgAdminIds));
+  // pagination > 1. We pass the team set into the recursive normalizer so
+  // every nested reply's author gets a role tag (or "unknown" when no
+  // team is configured).
+  const tree = allRaw.map((r) => normalizeComment(r, team));
 
   // Sort replies within each node by createdAt asc, and roots too.
   function sortReplies(node: NormalizedComment): void {
@@ -644,10 +675,14 @@ function findLastCommentWhere(
  * + /api/v1/organization admins); when the caller passes a runtime
  * override we re-classify each comment's author on the fly. Used by
  * getStalledPromises so a single call can re-tag engagement.
+ *
+ * When `trackMatchedIds` is provided, every userId that the override set
+ * matched against is recorded — used to surface unusedTeamUserIds.
  */
 function computeEngagementWithTeamOverride(
   comments: NormalizedComment[],
   teamSet: ReadonlySet<string>,
+  trackMatchedIds?: Set<string>,
 ): EngagementFields {
   let hasAdminReply = false;
   let adminReplyCount = 0;
@@ -658,6 +693,7 @@ function computeEngagementWithTeamOverride(
 
   function walk(comment: NormalizedComment): void {
     const isAdmin = teamSet.has(comment.author.userId);
+    if (isAdmin && trackMatchedIds) trackMatchedIds.add(comment.author.userId);
     if (!lastCommentDate || comment.createdAt > lastCommentDate) {
       lastCommentDate = comment.createdAt;
     }
@@ -961,6 +997,23 @@ export const client = {
         : null;
     const teamSource: "override" | "default" = teamOverride ? "override" : "default";
 
+    // When using the default team set, check that the server actually has
+    // team IDs configured. If not (env var empty AND /api/v1/organization
+    // admins empty), engagement fields are absent from the listing and we
+    // would silently return totalCandidates: 0. Surface the gap so the
+    // agent knows to call find_featurebase_user.
+    let warning: string | undefined;
+    let unusedTeamUserIds: string[] | undefined;
+    if (!teamOverride) {
+      const team = await getEffectiveTeamSet();
+      if (!team.configured) {
+        warning =
+          "No team IDs configured — stalled-promise detection requires knowing who your team is. " +
+          "Call find_featurebase_user with your name to discover your user ID, then pass the " +
+          "returned userIds as teamUserIds. Alternatively set FEATUREBASE_TEAM_USER_IDS env var.";
+      }
+    }
+
     // If a team override is in play, re-classify engagement from cached
     // comments using the override set; otherwise use the pre-computed
     // engagement on each post (from the listing enrichment).
@@ -969,13 +1022,20 @@ export const client = {
       const withComments = all.normalized.filter(
         (p) => !p.commentFetchFailed && p.commentCount > 0,
       );
+      // Track which override IDs actually appeared in any comment walk so
+      // we can flag unused ones (the "fake-id" silent-filter bug).
+      const matchedIds = new Set<string>();
       const recomputed = await mapWithConcurrency(
         withComments,
         COMMENTS_CONCURRENCY,
         async (p) => {
           try {
             const comments = await getComments(p.id);
-            const eng = computeEngagementWithTeamOverride(comments, teamOverride);
+            const eng = computeEngagementWithTeamOverride(
+              comments,
+              teamOverride,
+              matchedIds,
+            );
             return { p, eng };
           } catch (err) {
             console.error(
@@ -986,10 +1046,14 @@ export const client = {
           }
         },
       );
-      candidates = recomputed.filter((x): x is { p: NormalizedPost; eng: EngagementFields } => !!x).map(({ p, eng }) => ({
-        ...p,
-        ...eng,
-      }));
+      candidates = recomputed
+        .filter((x): x is { p: NormalizedPost; eng: EngagementFields } => !!x)
+        .map(({ p, eng }) => ({ ...p, ...eng }));
+
+      // Any override ID that didn't show up in any comment is "unused".
+      // Could be a fake ID, or a real user who just never commented.
+      const unused = [...teamOverride].filter((id) => !matchedIds.has(id));
+      if (unused.length > 0) unusedTeamUserIds = unused;
     } else {
       candidates = all.normalized.filter((p) => !p.commentFetchFailed);
     }
@@ -1095,6 +1159,8 @@ export const client = {
     return {
       minDaysSinceAdminReply: minDays,
       teamSource,
+      warning,
+      unusedTeamUserIds,
       totalCandidates: stalled.length,
       returned: enriched.length,
       promises: enriched,
