@@ -43,13 +43,11 @@ Earlier versions of this MCP were limited to the ~20 posts the SSR `__NEXT_DATA_
 ## Tool reference
 
 ### `list_featurebase_posts`
-**Args:** `status?` (`open`/`planned`/`in_progress`/`complete`/`all`, default `all`), `sortBy?` (`date:desc`/`date:asc`/`upvotes:desc`, default `date:desc`), `limit?` (1–200, default 50)
+**Args:** `status?` (`open`/`planned`/`in_progress`/`complete`/`all`, default `all`), `sortBy?` (`date:desc`/`date:asc`/`upvotes:desc`, default `date:desc`), `limit?` (1–200, default 50), `hasAdminReply?` (boolean)
 
 **Returns:** `{ totalResults, availableResults, truncated, returned, posts: NormalizedPost[] }`
 
-The `truncated` flag tells you when the SSR snapshot doesn't cover the full board.
-
-Each post in `posts[]` carries engagement metadata: `hasAdminReply`, `adminReplyCount`, `customerCommentCount`, `lastCommentDate`, `adminLastReplyDate`, `customerLastReplyDate`, and `commentFetchFailed` (only set when the comments fetch failed for that post). The enrichment is eager — every post with `commentCount > 0` has its comment thread fetched once during listing, with concurrency capped at 8 to avoid hammering the API. On a 56-post board with 33 having comments, this costs ~33 comment fetches on first listing miss and zero on cache hits.
+The `truncated` flag tells you when the SSR snapshot doesn't cover the full board. `hasAdminReply=true` restricts to posts where the team has authored at least one comment (loud-failure: returns empty if no team IDs configured). Each post in `posts[]` carries engagement metadata: `hasAdminReply`, `adminReplyCount`, `customerCommentCount`, `lastCommentDate`, `adminLastReplyDate`, `customerLastReplyDate`, and `commentFetchFailed` (only set when the comments fetch failed for that post). The enrichment is eager — every post with `commentCount > 0` has its comment thread fetched once during listing, with concurrency capped at 8 to avoid hammering the API.
 
 ### `get_featurebase_post`
 **Args:** `slug` (required), `include_comments?` (default `false`), `teamUserIds?` (string[] — runtime override)
@@ -88,7 +86,7 @@ Returns posts in the order requested. Missing slugs go into `notFound` instead o
 Counts are labeled `*InSnapshot` to make it explicit they're computed over the SSR-bundled subset, not the full board.
 
 ### `get_featurebase_stalled_promises`
-**Args:** `minDaysSinceAdminReply?` (0–365, default 7), `limit?` (1–50, default 20), `teamUserIds?` (string[] — runtime override)
+**Args:** `minDaysSinceAdminReply?` (0–365, default 7), `limit?` (1–50, default 20), `teamUserIds?` (string[]), `status?` (string[] — restrict to these statuses), `sortBy?` (`staleness`/`freshness`/`upvotes`, default `staleness`)
 
 **Returns:** `{ minDaysSinceAdminReply, teamSource, warning?, unusedTeamUserIds?, totalCandidates, returned, promises: StalledPromise[] }`
 
@@ -96,22 +94,33 @@ Counts are labeled `*InSnapshot` to make it explicit they're computed over the S
 
 `warning` is set when `teamSource === "default"` AND no team IDs are configured — the response is empty (`totalCandidates: 0`) because engagement can't be classified. The warning tells the agent to call `find_featurebase_user` or set the env var.
 
-`unusedTeamUserIds` is set when `teamUserIds` was passed with at least one ID that didn't appear in any comment thread. Could be a fake ID, or a real user who just never commented. Helps the agent catch config typos.
+`unusedTeamUserIds` is set when `teamUserIds` was passed with at least one ID that didn't appear in any comment thread. Could be a fake ID, or a real user who just never commented.
 
-Each `StalledPromise` carries: `slug`, `title`, `url`, `status`, `commentCount`, `upvotes`, `author`, `date`, `adminLastReplyDate`, `customerLastReplyDate`, `daysSinceAdminReply`, `lastAdminMessage` (200-char excerpt + author + date), `lastCustomerMessage` (200-char excerpt + author + date). Sorted by `customerLastReplyDate` desc.
+`status` accepts any of `["open", "in_review", "planned", "in_progress", "completed"]` and restricts candidates. Useful to exclude Completed/Planned.
+
+`sortBy` controls response order:
+- `"staleness"` (default): `customerLastReplyDate` desc — most-recent stalled promises first
+- `"freshness"`: `adminLastReplyDate` desc — most-recent admin replies first (catch up on what you just said)
+- `"upvotes"`: `upvotes` desc — focus on high-impact items regardless of staleness
+
+Each `StalledPromise` carries: `slug`, `title`, `url`, `status`, `commentCount`, `upvotes`, `author`, `date`, `adminLastReplyDate`, `customerLastReplyDate`, `daysSinceAdminReply`, `lastAdminMessage` (200-char excerpt + author + date), `lastCustomerMessage` (200-char excerpt + author + date).
 
 This is the "I said I'd look into it in a comment and forgot to follow up" view. Two ways to identify admins:
 1. **Auto**: set `FEATUREBASE_TEAM_USER_IDS` env var (recommended for production)
 2. **Self-service**: ask the user for their name, call `find_featurebase_user` to look up the IDs, then pass them as `teamUserIds`
 
 ### `find_featurebase_user`
-**Args:** `name` (required, partial match, case-insensitive), `sampleSize?` (0–20, default 5)
+**Args:** `name` (required, partial match, case-insensitive, min 2 chars), `sampleSize?` (0–20, default 5)
 
 **Returns:** `{ query, samplePostsScanned, matches: UserMatch[] }`
 
-Each `UserMatch` carries: `userId`, `name`, `postCount`, `commentCount`, `guessedRole` (`"admin"` if user never posts but does comment, `"customer"` otherwise). Sorted by `commentCount` desc — the most active commenters (likely your team) surface first.
+Each `UserMatch` carries: `userId`, `name`, `postCount`, `commentCountInSampledPosts` (within `sampleSize` recent threads), `totalCommentCount` (board-wide — main signal), `guessedRole` (`"admin"` if user never posts but does comment, `"customer"` otherwise).
 
-Scans post authors from the listing (always available) plus the comment threads of the N most recent posts with comments (default 5, max 20). Cached comments make this cheap after the first listing miss.
+**Sort order**: `guessedRole === "admin"` first (most likely team), then by `totalCommentCount` desc. The most active commenters surface first within each role bucket.
+
+The minimum-2-characters constraint prevents single-letter queries from matching everything on the board (e.g. `"a"` would otherwise match `"MAN"`).
+
+Scans post authors from the listing (always available) plus the comment threads of the N most recent posts with comments (default 5, max 20). Cached comments make this cheap after the first listing miss. `totalCommentCount` is computed from a board-wide index built during listing enrichment — no extra pass.
 
 ## Install
 

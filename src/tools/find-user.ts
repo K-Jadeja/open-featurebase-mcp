@@ -4,12 +4,14 @@ import { client } from "../client.js";
 export const FindUserArgsSchema = {
   name: z
     .string()
-    .min(1)
+    .min(2)
     .describe(
-      "Partial name to search for, case-insensitive. Scans post authors " +
-        "and the comment threads of the N most recent posts with comments. " +
-        "Example: 'Krishna' returns 'Krishna - Remalt Dev' if they've posted " +
-        "or commented on the board.",
+      "Partial name to search for, case-insensitive. Minimum 2 characters " +
+        "to avoid matching everything on boards with common one-letter " +
+        "fragments (e.g. 'a' would otherwise surface every user with 'A' " +
+        "in their name). Scans post authors and the comment threads of " +
+        "the N most recent posts with comments. Example: 'Krishna' returns " +
+        "'Krishna - Remalt Dev' if they've posted or commented on the board.",
     ),
   sampleSize: z
     .number()

@@ -251,6 +251,13 @@ interface ListingPayload {
   normalized: NormalizedPost[];
   totalResults: number;
   availableResults: number;
+  /**
+   * userId → total number of comments authored across all threads on the
+   * board. Computed once during the engagement enrichment loop so
+   * find_featurebase_user can return board-wide `totalCommentCount`
+   * without an extra pass.
+   */
+  commentCountByUserId: Map<string, number>;
 }
 
 interface ApiPage {
@@ -330,36 +337,43 @@ async function getAllPosts(): Promise<ListingPayload> {
   // deliberately skip this so the response loudly omits engagement fields
   // instead of computing them against an empty team (which would mark
   // every comment as "customer" — silent corruption).
-  if (team.configured) {
-    const rawWithComments = raw.filter((r) => (r.commentCount ?? 0) > 0);
-    if (rawWithComments.length > 0) {
-      const fetched = await mapWithConcurrency(
-        rawWithComments,
-        COMMENTS_CONCURRENCY,
-        async (r) => {
-          try {
-            const comments = await getComments(r.id);
-            return { id: r.id, engagement: computeEngagement(comments) };
-          } catch (err) {
-            console.error(
-              `[featurebase-mcp] comments fetch failed for ${r.slug}:`,
-              err,
-            );
-            return { id: r.id, engagement: null };
-          }
-        },
-      );
-      const engagementByPostId = new Map<string, EngagementFields>();
-      const failedPostIds = new Set<string>();
-      for (const { id, engagement } of fetched) {
-        if (engagement) engagementByPostId.set(id, engagement);
-        else failedPostIds.add(id);
-      }
-      for (const post of normalized) {
-        const eng = engagementByPostId.get(post.id);
-        if (eng) Object.assign(post, eng);
-        else if (failedPostIds.has(post.id)) post.commentFetchFailed = true;
-      }
+  const commentCountByUserId = new Map<string, number>();
+  const rawWithComments = raw.filter((r) => (r.commentCount ?? 0) > 0);
+  if (team.configured && rawWithComments.length > 0) {
+    const fetched = await mapWithConcurrency(
+      rawWithComments,
+      COMMENTS_CONCURRENCY,
+      async (r) => {
+        try {
+          const comments = await getComments(r.id);
+          return { id: r.id, engagement: computeEngagement(comments), comments };
+        } catch (err) {
+          console.error(
+            `[featurebase-mcp] comments fetch failed for ${r.slug}:`,
+            err,
+          );
+          return { id: r.id, engagement: null, comments: [] as NormalizedComment[] };
+        }
+      },
+    );
+    const engagementByPostId = new Map<string, EngagementFields>();
+    const failedPostIds = new Set<string>();
+    for (const { id, engagement, comments } of fetched) {
+      if (engagement) engagementByPostId.set(id, engagement);
+      else failedPostIds.add(id);
+      // Build board-wide per-author comment count while comments are
+      // already loaded — used by find_featurebase_user.totalCommentCount.
+      walkComments(comments, (c) => {
+        commentCountByUserId.set(
+          c.author.userId,
+          (commentCountByUserId.get(c.author.userId) ?? 0) + 1,
+        );
+      });
+    }
+    for (const post of normalized) {
+      const eng = engagementByPostId.get(post.id);
+      if (eng) Object.assign(post, eng);
+      else if (failedPostIds.has(post.id)) post.commentFetchFailed = true;
     }
   }
 
@@ -368,6 +382,7 @@ async function getAllPosts(): Promise<ListingPayload> {
     normalized,
     totalResults,
     availableResults: raw.length,
+    commentCountByUserId,
   };
   cacheSet(cacheKey, out, TTL.listing);
   return out;
@@ -764,6 +779,7 @@ export interface ListPostsArgs {
   status: "all" | "open" | "in_review" | "planned" | "in_progress" | "completed";
   sortBy: "date:desc" | "date:asc" | "upvotes:desc";
   limit: number;
+  hasAdminReply?: boolean;
 }
 
 export interface SearchPostsArgs {
@@ -822,6 +838,17 @@ export const client = {
     if (args.status !== "all") {
       const want = STATUS_TYPE_MAP[args.status];
       posts = posts.filter((p) => p.status.type === want);
+    }
+
+    if (args.hasAdminReply !== undefined) {
+      // hasAdminReply is only present when (team configured + comments
+      // fetched); absent otherwise. The filter compares against the literal
+      // boolean — a post with hasAdminReply undefined never matches when
+      // args.hasAdminReply is true, which is the loud-failure contract
+      // (filtering on data we don't have should return nothing).
+      posts = posts.filter(
+        (p) => (p.hasAdminReply ?? null) === args.hasAdminReply,
+      );
     }
 
     posts = sortPosts(posts, args.sortBy).slice(0, args.limit);
@@ -1037,12 +1064,26 @@ export const client = {
     minDaysSinceAdminReply?: number;
     limit?: number;
     teamUserIds?: string[];
+    status?: Array<
+      "open" | "in_review" | "planned" | "in_progress" | "completed"
+    >;
+    sortBy?: "staleness" | "freshness" | "upvotes";
   } = {}) {
     const minDays = Math.max(0, Math.floor(args.minDaysSinceAdminReply ?? 7));
     const limit = Math.max(1, Math.min(args.limit ?? 20, 50));
+    const sortBy = args.sortBy ?? "staleness";
     const all = await getAllPosts();
     const now = Date.now();
     const minMs = minDays * 24 * 60 * 60 * 1000;
+
+    // Map user-friendly status enum → internal postStatus.type. Same mapping
+    // as STATUS_TYPE_MAP but built locally so this tool doesn't depend on
+    // listing internals.
+    const wantedTypes = new Set<string>();
+    for (const friendly of args.status ?? []) {
+      const mapped = STATUS_TYPE_MAP[friendly];
+      if (mapped) wantedTypes.add(mapped);
+    }
 
     const teamOverride =
       args.teamUserIds && args.teamUserIds.length > 0
@@ -1051,10 +1092,10 @@ export const client = {
     const teamSource: "override" | "default" = teamOverride ? "override" : "default";
 
     // When using the default team set, check that the server actually has
-    // team IDs configured. If not (env var empty AND /api/v1/organization
-    // admins empty), engagement fields are absent from the listing and we
-    // would silently return totalCandidates: 0. Surface the gap so the
-    // agent knows to call find_featurebase_user.
+    // team IDs configured. If not (env var empty AND no team IDs known),
+    // engagement fields are absent from the listing and we would silently
+    // return totalCandidates: 0. Surface the gap so the agent knows to
+    // call find_featurebase_user.
     let warning: string | undefined;
     let unusedTeamUserIds: string[] | undefined;
     if (!teamOverride) {
@@ -1114,13 +1155,25 @@ export const client = {
     const stalled = candidates.filter((p) => {
       if (!p.adminLastReplyDate || !p.customerLastReplyDate) return false;
       if (p.customerLastReplyDate <= p.adminLastReplyDate) return false;
-      return now - new Date(p.adminLastReplyDate).getTime() >= minMs;
+      if (now - new Date(p.adminLastReplyDate).getTime() < minMs) return false;
+      if (wantedTypes.size > 0 && !wantedTypes.has(p.status.type)) return false;
+      return true;
     });
-    stalled.sort((a, b) =>
-      (b.customerLastReplyDate ?? "").localeCompare(
-        a.customerLastReplyDate ?? "",
-      ),
-    );
+    stalled.sort((a, b) => {
+      switch (sortBy) {
+        case "freshness":
+          return (b.adminLastReplyDate ?? "").localeCompare(
+            a.adminLastReplyDate ?? "",
+          );
+        case "upvotes":
+          return b.upvotes - a.upvotes;
+        case "staleness":
+        default:
+          return (b.customerLastReplyDate ?? "").localeCompare(
+            a.customerLastReplyDate ?? "",
+          );
+      }
+    });
 
     const sliced = stalled.slice(0, limit);
 
@@ -1237,13 +1290,16 @@ export const client = {
   async findUser(args: { name: string; sampleSize?: number }) {
     const all = await getAllPosts();
     const lower = (args.name ?? "").toLowerCase().trim();
-    if (!lower) return { query: args.name, samplePostsScanned: 0, matches: [] };
+    if (!lower) {
+      return { query: args.name, samplePostsScanned: 0, matches: [] };
+    }
 
     type Match = {
       userId: string;
       name: string;
       postCount: number;
-      commentCount: number;
+      commentCountInSampledPosts: number;
+      totalCommentCount: number;
       guessedRole: CommentRole;
     };
     const matches = new Map<string, Match>();
@@ -1258,14 +1314,16 @@ export const client = {
             userId: p.author.userId,
             name: p.author.name,
             postCount: 1,
-            commentCount: 0,
+            commentCountInSampledPosts: 0,
+            totalCommentCount: all.commentCountByUserId.get(p.author.userId) ?? 0,
             guessedRole: "customer",
           });
       }
     }
 
-    // 2. Scan comment authors in a sample of recent posts with comments.
-    //    Cached comments make this cheap after first listing miss.
+    // 2. Scan comment authors in a sample of recent posts. Cached comments
+    //    make this cheap after first listing miss. totalCommentCount is
+    //    filled from the board-wide index maintained by getAllPosts.
     const sampleSize = Math.max(0, Math.min(args.sampleSize ?? 5, 20));
     const samplePosts = all.normalized
       .filter((p) => p.commentCount > 0)
@@ -1278,13 +1336,15 @@ export const client = {
         walkComments(comments, (c) => {
           if (!c.author.name.toLowerCase().includes(lower)) return;
           const existing = matches.get(c.author.userId);
-          if (existing) existing.commentCount++;
+          if (existing) existing.commentCountInSampledPosts++;
           else
             matches.set(c.author.userId, {
               userId: c.author.userId,
               name: c.author.name,
               postCount: 0,
-              commentCount: 1,
+              commentCountInSampledPosts: 1,
+              totalCommentCount:
+                all.commentCountByUserId.get(c.author.userId) ?? 0,
               // Never posted = likely team. (Customer lurkers are rare.)
               guessedRole: "admin",
             });
@@ -1297,10 +1357,14 @@ export const client = {
       }
     }
 
-    const out = Array.from(matches.values()).sort(
-      (a, b) =>
-        b.commentCount - a.commentCount || b.postCount - a.postCount,
-    );
+    // Sort: guessedRole='admin' first (most likely team), then by
+    // totalCommentCount desc (most active commenters surface first).
+    const out = Array.from(matches.values()).sort((a, b) => {
+      if (a.guessedRole !== b.guessedRole) {
+        return a.guessedRole === "admin" ? -1 : 1;
+      }
+      return b.totalCommentCount - a.totalCommentCount;
+    });
     return {
       query: args.name,
       samplePostsScanned: samplePosts.length,

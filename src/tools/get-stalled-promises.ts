@@ -31,12 +31,33 @@ export const GetStalledPromisesArgsSchema = {
         "env-var configuration. Engagement fields are re-computed on the " +
         "fly from cached comments using this set.",
     ),
+  status: z
+    .array(z.enum(["open", "in_review", "planned", "in_progress", "completed"]))
+    .optional()
+    .describe(
+      "Restrict candidates to posts with these statuses (e.g. " +
+        "['in_progress', 'in_review'] to exclude Completed and Planned). " +
+        "When omitted, all statuses are eligible.",
+    ),
+  sortBy: z
+    .enum(["staleness", "freshness", "upvotes"])
+    .default("staleness")
+    .describe(
+      "Sort order for returned stalled promises. " +
+        "'staleness' (default): customerLastReplyDate desc — most-recent " +
+        "stalled promises first. " +
+        "'freshness': adminLastReplyDate desc — most-recent admin replies " +
+        "first (catch up on what you just said). " +
+        "'upvotes': upvotes desc — focus on high-impact items regardless of staleness.",
+    ),
 };
 
 export async function getStalledPromises(args: {
   minDaysSinceAdminReply: number;
   limit: number;
   teamUserIds?: string[];
+  status?: Array<"open" | "in_review" | "planned" | "in_progress" | "completed">;
+  sortBy: "staleness" | "freshness" | "upvotes";
 }) {
   const result = await client.getStalledPromises(args);
   return {

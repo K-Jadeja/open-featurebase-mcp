@@ -21,12 +21,23 @@ export const ListPostsArgsSchema = {
     .max(200)
     .default(50)
     .describe("Maximum number of posts to return (1-200)."),
+  hasAdminReply: z
+    .boolean()
+    .optional()
+    .describe(
+      "When true, restrict to posts where the team has authored at least " +
+        "one comment (hasAdminReply === true). When false, restrict to posts " +
+        "where the team has NOT commented. Requires FEATUREBASE_TEAM_USER_IDS " +
+        "to be set or the request will return empty (engagement classification " +
+        "is skipped when no team IDs are configured — see known limitations).",
+    ),
 };
 
 export async function listPosts(args: {
   status: "all" | "open" | "in_review" | "planned" | "in_progress" | "completed";
   sortBy: "date:desc" | "date:asc" | "upvotes:desc";
   limit: number;
+  hasAdminReply?: boolean;
 }) {
   const result = await client.listPosts(args);
   return {
