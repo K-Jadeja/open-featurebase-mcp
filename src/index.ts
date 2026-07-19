@@ -4,12 +4,41 @@
  *
  * Reverse-engineered scraper for public Featurebase feedback boards.
  * See README.md for tool reference and architecture notes.
+ *
+ * ## Validation strategy
+ *
+ * We need two properties together:
+ *   1. **Detailed public schemas** — agents calling the MCP need to know
+ *      each tool's argument shape (types, required fields, enums, defaults,
+ *      descriptions). Otherwise they have to guess.
+ *   2. **Clean validation errors** — when the agent's input fails validation,
+ *      we surface a single readable line like
+ *      `minDaysSinceAdminReply: must be at most 365` — not Zod's raw
+ *      JSON-stringified issues array.
+ *
+ * The MCP SDK's default `validateToolInput` only does (1) by passing args
+ * through `safeParse` and JSON.stringify-ing the resulting issues on failure
+ * (ugly). We achieve both by *subclassing* `McpServer` and overriding
+ * `validateToolInput` to throw a single `McpError` with our clean formatter
+ * while leaving the SDK's `inputSchema` registration untouched (so
+ * `listTools` returns the real schemas).
+ *
+ * No global Zod mutation, no module-level caches, no value echo —
+ * everything is local to the validate call.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+
+import { formatZodIssue } from "./validation.js";
+
+// Re-export formatZodIssue so unit tests can import it without reaching
+// into a private module path. Production code only uses it inside
+// validateToolInput.
+export { formatZodIssue };
+export { aggregateCommentCounts } from "./aggregation.js";
 
 import { listPosts, ListPostsArgsSchema } from "./tools/list-posts.js";
 import { getPost, GetPostArgsSchema } from "./tools/get-post.js";
@@ -20,91 +49,45 @@ import { getStalledPromises, GetStalledPromisesArgsSchema } from "./tools/get-st
 import { findUser, FindUserArgsSchema } from "./tools/find-user.js";
 
 // ---------------------------------------------------------------------------
-// Per-tool validation wrapper.
-//
-// Why we don't use the SDK's built-in Zod validation: it formats errors
-// by JSON.stringify-ing the issues array, exposing Zod's internal shape
-// (code, path, inclusive, exact, etc.) alongside any custom message. A
-// previous fix (ZodError.prototype.message override) was hacky and
-// unsafe — global state, leaks across requests, breaks Zod in isolation.
-//
-// This helper runs at the MCP tool boundary, request-scoped (no shared
-// state). It does NOT mutate Zod globally. It does NOT echo arbitrary
-// input values into the response — only field names + constraints, so
-// secrets or large payloads cannot leak via a validation error.
-//
-// We register tools via registerTool(name, config, cb) (config-object
-// form) so the SDK accepts a passthrough ZodObject as inputSchema
-// without re-introducing the JSON.stringify error format. The position-
-// arg form rejects ZodObject via its arg-shape check.
+// Tool registration helpers.
 // ---------------------------------------------------------------------------
 
-/**
- * Permissive tool-args schema. `.passthrough()` accepts any object and
- * preserves unknown keys in the parsed output. Real validation happens
- * inside our wrapper (clean text, request-scoped, no Zod internals, no
- * echoed values). The as-any cast bypasses TypeScript's ZodRawShape
- * union constraint; the runtime value is unchanged.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const ANY_ARGS = z.object({}).passthrough() as any;
-
-/**
- * Format a Zod issue into a clean human-readable string. Bounds and
- * expected types only — never the failing value.
- */
-function formatZodIssue(issue: z.ZodIssue): string {
-  const path = (issue.path ?? []).join(".") || "argument";
-  switch (issue.code) {
-    case "too_big":
-      return `${path}: must be at most ${issue.maximum}${
-        issue.inclusive ? "" : " (exclusive)"
-      }`;
-    case "too_small":
-      return `${path}: must be at least ${issue.minimum}${
-        issue.inclusive ? "" : " (exclusive)"
-      }`;
-    case "invalid_type":
-      return `${path}: expected ${issue.expected}, received ${issue.received}`;
-    case "invalid_enum_value":
-      return `${path}: must be one of ${(issue.options ?? []).join(", ")}`;
-    case "invalid_string":
-      return `${path}: ${issue.validation ?? "invalid string"}`;
-    case "unrecognized_keys":
-      return `${path}: unrecognized keys ${JSON.stringify(issue.keys ?? [])}`;
-    default:
-      return `${path}: ${issue.message ?? "invalid"}`;
-  }
+function toZodObject<S extends z.ZodRawShape>(shape: S) {
+  return z.object(shape);
 }
 
-/**
- * Validate raw input against a strict Zod schema at the MCP boundary.
- * Throws a single McpError whose message is the joined clean issue text.
- * No module-level caches — concurrent requests cannot contaminate each
- * other.
- */
-function validateArgs<S extends z.ZodTypeAny>(schema: S, raw: unknown): z.infer<S> {
-  const result = schema.safeParse(raw);
-  if (!result.success) {
-    const messages = result.error.issues.map(formatZodIssue).join("; ");
-    throw new McpError(ErrorCode.InvalidParams, messages);
-  }
-  return result.data;
-}
+// ---------------------------------------------------------------------------
+// Subclassed McpServer — overrides validateToolInput to throw a clean
+// McpError instead of letting the SDK JSON.stringify the issues array.
+//
+// Listing-tools discovery is unchanged: `listTools` calls
+// `toJsonSchemaCompat(inputSchema)` which descends into the real ZodObject
+// and produces a complete JSON Schema (types, enums, defaults, descriptions,
+// `additionalProperties: false`). Agents see real argument shapes.
+// ---------------------------------------------------------------------------
 
-/**
- * Build a tool handler that validates its arguments against `shape` and
- * then calls `handler(validated)`. The closure holds no state; safe under
- * concurrency.
- */
-function withValidation<S extends z.ZodRawShape>(
-  shape: S,
-  handler: (args: z.output<z.ZodObject<S>>) => Promise<{
-    content: Array<{ type: "text"; text: string }>;
-  }>,
-) {
-  const schema = z.object(shape);
-  return async (raw: unknown) => handler(validateArgs(schema, raw));
+// Validate-with-clean-format approach.
+//
+// The MCP SDK's McpServer.validateToolInput is marked private in its
+// public types but it's a regular method at runtime. We instantiate
+// McpServer normally, then override the method on the instance to
+// produce a single McpError with our formatter (request-scoped, no
+// shared state). Tools are registered with their REAL ZodObject schemas
+// — listTools advertises the full shape (types, required fields, enums,
+// defaults, descriptions, `additionalProperties: false`).
+function cleanValidateToolInput(
+  tool: { inputSchema?: z.ZodTypeAny },
+  args: unknown,
+  _toolName: string,
+): Promise<unknown> {
+  if (!tool.inputSchema) return Promise.resolve(undefined);
+  return tool.inputSchema.safeParseAsync(args).then((result) => {
+    if (!result.success) {
+      const messages = result.error.issues.map(formatZodIssue).join("; ");
+      throw new McpError(ErrorCode.InvalidParams, messages);
+    }
+    return result.data;
+  });
 }
 
 const server = new McpServer({
@@ -112,11 +95,23 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
+// Override the instance method. This shadows the parent's validator for
+// every tools/call on this server. No global mutation — single instance,
+// single assignment at startup. Function-scoped; safe under concurrency
+// since each invocation constructs its own messages string.
+(server as unknown as {
+  validateToolInput: (
+    tool: { inputSchema?: z.ZodTypeAny },
+    args: unknown,
+    toolName: string,
+  ) => Promise<unknown>;
+}).validateToolInput = cleanValidateToolInput;
+
 // ---------------------------------------------------------------------------
-// Tool registrations via registerTool() (config-object form).
-// Position-arg form (server.tool) rejected ZodObject via isZodRawShapeCompat
-// and dropped args via executeToolHandler's no-inputSchema branch; config-
-// object form accepts a ZodObject directly via getZodSchemaObject.
+// Tool registrations — every tool advertises its REAL input schema (built
+// from the raw shape exported by the tool file). Defaults and constraints
+// are preserved through the ZodObject. Validation runs through our clean
+// formatter via FeaturebaseMcpServer above.
 // ---------------------------------------------------------------------------
 
 server.registerTool(
@@ -126,9 +121,9 @@ server.registerTool(
       "List posts on the configured Featurebase feedback board. " +
       "Optionally filter by status, sort by date/upvotes, restrict to " +
       "posts where the team has commented via hasAdminReply.",
-    inputSchema: ANY_ARGS,
+    inputSchema: toZodObject(ListPostsArgsSchema),
   },
-  withValidation(ListPostsArgsSchema, listPosts),
+  (args) => listPosts(args as Parameters<typeof listPosts>[0]),
 );
 
 server.registerTool(
@@ -142,9 +137,9 @@ server.registerTool(
       "agent can distinguish team replies from customer messages. " +
       "Optional teamUserIds overrides the configured team set for role " +
       "tagging.",
-    inputSchema: ANY_ARGS,
+    inputSchema: toZodObject(GetPostArgsSchema),
   },
-  withValidation(GetPostArgsSchema, getPost),
+  (args) => getPost(args as Parameters<typeof getPost>[0]),
 );
 
 server.registerTool(
@@ -157,9 +152,9 @@ server.registerTool(
       "Set include_content=true to inline full contentHtml + " +
       "contentText on each post (otherwise only the 800-char excerpt " +
       "is returned).",
-    inputSchema: ANY_ARGS,
+    inputSchema: toZodObject(GetPostsArgsSchema),
   },
-  withValidation(GetPostsArgsSchema, getPosts),
+  (args) => getPosts(args as Parameters<typeof getPosts>[0]),
 );
 
 server.registerTool(
@@ -167,12 +162,11 @@ server.registerTool(
   {
     description:
       "Search the Featurebase board by keyword. Matches against post " +
-      "titles (weighted 3x) and bodies (1x), with per-token matching " +
-      "for multi-word queries. Returns up to N posts ordered by " +
-      "relevance score.",
-    inputSchema: ANY_ARGS,
+      "titles (weighted 3x) and bodies (1x), with per-token matching for " +
+      "multi-word queries. Returns up to N posts ordered by relevance score.",
+    inputSchema: toZodObject(SearchPostsArgsSchema),
   },
-  withValidation(SearchPostsArgsSchema, searchPosts),
+  (args) => searchPosts(args as Parameters<typeof searchPosts>[0]),
 );
 
 server.registerTool(
@@ -184,9 +178,9 @@ server.registerTool(
       "upvoted posts, and the N most recent posts. Also returns " +
       "snapshotWindow describing the date range the SSR snapshot " +
       "actually covers.",
-    inputSchema: ANY_ARGS,
+    inputSchema: toZodObject(GetStatsArgsSchema),
   },
-  withValidation(GetStatsArgsSchema, getStats),
+  (args) => getStats(args as Parameters<typeof getStats>[0]),
 );
 
 server.registerTool(
@@ -202,9 +196,10 @@ server.registerTool(
       "changes ordering. If you don't have admin user IDs configured, " +
       "ask the user for their name, call find_featurebase_user to look " +
       "up the IDs, then pass them via teamUserIds.",
-    inputSchema: ANY_ARGS,
+    inputSchema: toZodObject(GetStalledPromisesArgsSchema),
   },
-  withValidation(GetStalledPromisesArgsSchema, getStalledPromises),
+  (args) =>
+    getStalledPromises(args as Parameters<typeof getStalledPromises>[0]),
 );
 
 server.registerTool(
@@ -216,10 +211,12 @@ server.registerTool(
       "threads of the N most recent posts with comments. Returns " +
       "matching users with postCount, commentCountInSampledPosts, " +
       "totalCommentCount, and guessedRole. Sort: admin first, then by " +
-      "totalCommentCount desc.",
-    inputSchema: ANY_ARGS,
+      "totalCommentCount desc. totalCommentCount is board-wide; check " +
+      "commentsComplete in the response to confirm no post's comments " +
+      "fetch failed.",
+    inputSchema: toZodObject(FindUserArgsSchema),
   },
-  withValidation(FindUserArgsSchema, findUser),
+  (args) => findUser(args as Parameters<typeof findUser>[0]),
 );
 
 // ---------------------------------------------------------------------------

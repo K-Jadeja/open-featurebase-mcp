@@ -15,6 +15,7 @@
  */
 
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { appendFileSync } from "node:fs";
 import type {
   CommentRole,
   NormalizedAuthor,
@@ -22,6 +23,7 @@ import type {
   NormalizedPost,
   NormalizedPostDetail,
 } from "./types.js";
+import { aggregateCommentCounts } from "./aggregation.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -36,6 +38,62 @@ const USER_AGENT =
   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+
+// ---------------------------------------------------------------------------
+// Diagnostic network counter.
+//
+// Counts every outbound HTTP request this client makes. Only logs to
+// stderr when FEATUREBASE_DEBUG_NET=1 — opt-in for cold-cache perf tests
+// and production diagnostics. The counter increments per fetch but does
+// not mutate global state (no globalThis.fetch wrap).
+// ---------------------------------------------------------------------------
+
+let _httpReqCount = 0;
+
+export function getHttpRequestCount(): number {
+  return _httpReqCount;
+}
+
+export function resetHttpRequestCount(): void {
+  _httpReqCount = 0;
+}
+
+async function countedFetch(url: string, init: RequestInit): Promise<Response> {
+  _httpReqCount++;
+  if (process.env.FEATUREBASE_DEBUG_NET === "1") {
+    process.stderr.write(
+      `[net ${Date.now()}] ${init.method ?? "GET"} ${url}\n`,
+    );
+  }
+  // Test hook — opt-in via env var. Tests can force a partial fetch
+  // failure by setting FEATUREBASE_FAIL_URL_SUBSTR to a substring the
+  // target URL contains. Used by tests/partial-fetch.test.mjs.
+  if (
+    process.env.FEATUREBASE_FAIL_URL_SUBSTR &&
+    url.includes(process.env.FEATUREBASE_FAIL_URL_SUBSTR)
+  ) {
+    throw new Error(`test-forced failure: ${url}`);
+  }
+  return fetch(url, init);
+}
+
+/**
+ * Write the current HTTP request count to a file. Used by cold-cache
+ * perf tests so they can verify outbound HTTP count after a server run
+ * without needing to intercept the MCP transport's stderr stream.
+ *
+ * Env: FEATUREBASE_NET_COUNT_FILE — if set, the count is appended to
+ * this file (one line per write). Tests can read after a call completes.
+ */
+function emitNetCount(): void {
+  const file = process.env.FEATUREBASE_NET_COUNT_FILE;
+  if (!file) return;
+  try {
+    appendFileSync(file, `${_httpReqCount}\n`);
+  } catch (err) {
+    process.stderr.write(`[net-count-write] ${err}\n`);
+  }
+}
 
 const TTL = {
   listing: 300, // 5 min — covers all metadata reads
@@ -256,8 +314,20 @@ interface ListingPayload {
    * board. Computed once during the engagement enrichment loop so
    * find_featurebase_user can return board-wide `totalCommentCount`
    * without an extra pass.
+   *
+   * IMPORTANT: only counts comments from posts whose fetch succeeded.
+   * Check `commentsComplete` to know whether this is a true board-wide
+   * count or a partial count from a subset of posts.
    */
   commentCountByUserId: Map<string, number>;
+  /**
+   * `true` when every post-comment fetch in this listing's enrichment
+   * pass succeeded (or there were no posts with comments to fetch).
+   * `false` if any individual fetch failed — in that case
+   * `commentCountByUserId` is partial. Surfaced via
+   * find_featurebase_user's `commentsComplete` field.
+   */
+  commentsComplete: boolean;
 }
 
 interface ApiPage {
@@ -273,7 +343,7 @@ async function fetchApiPage(page: number): Promise<ApiPage> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
+    const res = await countedFetch(url, {
       headers: {
         "User-Agent": USER_AGENT,
         Accept: "application/json, text/plain, */*",
@@ -372,12 +442,13 @@ async function getAllPosts(): Promise<ListingPayload> {
     for (const { id, status, comments } of fetched) {
       // Build board-wide per-author comment count. Comments are
       // empty array on fetch failure, so this naturally skips failed posts.
-      walkComments(comments, (c) => {
+      const counts = aggregateCommentCounts(comments);
+      for (const [userId, count] of counts) {
         commentCountByUserId.set(
-          c.author.userId,
-          (commentCountByUserId.get(c.author.userId) ?? 0) + 1,
+          userId,
+          (commentCountByUserId.get(userId) ?? 0) + count,
         );
-      });
+      }
       if (status === "fetch_failed") {
         fetchFailedPostIds.add(id);
         continue;
@@ -397,14 +468,22 @@ async function getAllPosts(): Promise<ListingPayload> {
     }
   }
 
+  // commentsComplete: true iff every post-comment fetch succeeded. When
+  // there are no posts with comments at all, this is trivially true
+  // (nothing to fetch). When at least one fetch failed, false — the
+  // commentCountByUserId map is a partial count in that case.
+  const commentsComplete = fetchFailedPostIds.size === 0;
+
   const out: ListingPayload = {
     raw,
     normalized,
     totalResults,
     availableResults: raw.length,
     commentCountByUserId,
+    commentsComplete,
   };
   cacheSet(cacheKey, out, TTL.listing);
+  emitNetCount();
   return out;
 }
 
@@ -440,7 +519,7 @@ async function fetchOrg(): Promise<OrgPayload> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
+    const res = await countedFetch(url, {
       headers: {
         "User-Agent": USER_AGENT,
         Accept: "application/json, text/plain, */*",
@@ -507,7 +586,7 @@ async function fetchCommentsPage(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
+    const res = await countedFetch(url, {
       headers: {
         "User-Agent": USER_AGENT,
         Accept: "application/json, text/plain, */*",
@@ -1311,7 +1390,15 @@ export const client = {
     const all = await getAllPosts();
     const lower = (args.name ?? "").toLowerCase().trim();
     if (!lower) {
-      return { query: args.name, samplePostsScanned: 0, matches: [] };
+      return {
+        query: args.name,
+        samplePostsScanned: 0,
+        commentsComplete: all.commentsComplete,
+        warning: all.commentsComplete
+          ? undefined
+          : "Comment counts are partial — at least one post's comments failed to fetch in the listing enrichment pass.",
+        matches: [],
+      };
     }
 
     type Match = {
@@ -1385,9 +1472,14 @@ export const client = {
       }
       return b.totalCommentCount - a.totalCommentCount;
     });
+
     return {
       query: args.name,
       samplePostsScanned: samplePosts.length,
+      commentsComplete: all.commentsComplete,
+      warning: all.commentsComplete
+        ? undefined
+        : "Comment counts (totalCommentCount) are partial — at least one post's comments failed to fetch during the listing enrichment pass. Re-run after a few minutes to retry.",
       matches: out,
     };
   },
