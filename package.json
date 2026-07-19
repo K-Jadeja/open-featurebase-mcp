@@ -19,7 +19,7 @@
     "start": "node dist/index.js",
     "clean": "node scripts/clean.mjs",
     "pretest": "npm run build",
-    "test": "node tests/unit/aggregation.test.mjs && node tests/unit/validation-format.test.mjs && node tests/unit/server-construction.test.mjs && node tests/unit/sdk-version.test.mjs && node tests/unit/client-cold-cache.test.mjs && node tests/unit/client-partial-fetch.test.mjs && node tests/unit/inspect-schemas.test.mjs && node tests/unit/server-validation.test.mjs && node tests/unit/server-cache-isolation.test.mjs && node tests/unit/lazy-enrichment.test.mjs && node tests/unit/role-classification.test.mjs && node tests/unit/atomic-pagination.test.mjs",
+    "test": "node tests/unit/aggregation.test.mjs && node tests/unit/validation-format.test.mjs && node tests/unit/server-construction.test.mjs && node tests/unit/sdk-version.test.mjs && node tests/unit/client-cold-cache.test.mjs && node tests/unit/client-partial-fetch.test.mjs && node tests/unit/inspect-schemas.test.mjs && node tests/unit/server-validation.test.mjs && node tests/unit/server-cache-isolation.test.mjs && node tests/unit/lazy-enrichment.test.mjs && node tests/unit/role-classification.test.mjs && node tests/unit/atomic-pagination.test.mjs && node tests/unit/same-client-recovery.test.mjs",
     "test:live": "node scripts/with-env.mjs --live node tests/live/real-mcp.test.mjs"
   },
   "dependencies": {

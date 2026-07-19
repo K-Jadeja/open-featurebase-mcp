@@ -758,6 +758,7 @@ export interface Client {
     teamSource: "override" | "default" | "none";
     warning?: string;
     unusedTeamUserIds?: string[];
+    unusedTeamUserIdsComplete?: boolean;
     engagementComplete?: boolean;
     failedCommentPostCount?: number;
     failedPostSlugs?: string[];
@@ -859,6 +860,15 @@ export function createClient(opts: ClientOptions = {}): Client {
    * `commentsComplete === true` when every comment fetch succeeded.
    * `false` signals partial counts — find_featurebase_user surfaces a
    * warning in that case.
+   *
+   * ## Cache write policy (do NOT cache an incomplete index)
+   *
+   * When ANY comment fetch fails, the resulting index has under-counted
+   * some users — caching it under "comments:index" would let a later
+   * `find_featurebase_user` call consume stale incomplete counts. The
+   * incomplete result is returned for the CURRENT response only (with
+   * `complete: false`), and the next call to `ensureCommentIndex()`
+   * refetches every post's comments from scratch.
    */
   async function ensureCommentIndex(): Promise<{
     counts: Map<string, number>;
@@ -906,34 +916,82 @@ export function createClient(opts: ClientOptions = {}): Client {
     }
 
     const out = { counts, complete: fetchFailed === 0 };
-    cache.set("comments:index", out, TTL.comments);
+
+    // Only cache when complete. An incomplete index is returned for
+    // the current response only; the next ensureCommentIndex() call
+    // will refetch every post's comments.
+    if (out.complete) {
+      cache.set("comments:index", out, TTL.comments);
+    }
     return out;
   }
 
   /**
    * Listing only — does NOT fetch comments. Cost: 6 listing pages
    * (cached after first call). 0 comment fetches.
+   *
+   * ## Atomic multi-page contract (listing)
+   *
+   * Multi-page listing retrieval is ATOMIC — same rule as getComments().
+   * If page 1 fails OR any later required page fails, this function
+   * throws ONE McpError whose message lists the failed page numbers —
+   * and the listing cache is NOT populated. A partial listing must
+   * never be cached and never returned to callers as if it were
+   * complete. Downstream tools (list-posts, get-post, stalled-promises,
+   * find-user) all depend on a complete listing; a partial listing
+   * would corrupt `notFound` answers (a post that exists on the failed
+   * page would be falsely reported as not-found) and would let
+   * find-user claim a complete board-wide total when the listing is
+   * in fact incomplete.
    */
   async function getAllPosts(): Promise<ListingPayload> {
     const cacheKey = "list:all";
     const cached = cache.get<ListingPayload>(cacheKey);
     if (cached) return cached;
 
+    // Page 1 fetched eagerly to learn totalPages / totalResults.
     const first = await fetchApiPage(fetcher, 1);
     const totalPages = first.totalPages;
     const totalResults = first.totalResults;
 
+    // Pages 2..N fetched concurrently. Promise.allSettled lets us
+    // inspect each page's outcome independently.
     const rest = await Promise.allSettled(
       Array.from({ length: Math.max(0, totalPages - 1) }, (_, i) =>
         fetchApiPage(fetcher, i + 2),
       ),
     );
-    const successfulPages: ApiPage[] = [first];
-    for (const r of rest) {
-      if (r.status === "fulfilled") successfulPages.push(r.value);
+
+    // Atomic: if any required listing page failed, throw one McpError
+    // listing the failed pages. The cache is NOT populated. Retry on
+    // the same client refetches every page from scratch.
+    const failedPages = rest
+      .map((r, i) => ({ r, page: i + 2 }))
+      .filter(({ r }) => r.status === "rejected");
+    if (failedPages.length > 0) {
+      const firstError =
+        failedPages[0]!.r.status === "rejected"
+          ? failedPages[0]!.r.reason
+          : null;
+      const diag =
+        firstError instanceof Error
+          ? firstError.message
+          : String(firstError ?? "");
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Incomplete listing: failed pages ` +
+          `${failedPages.map((f) => f.page).join(", ")} of ${totalPages}. ` +
+          `Listing NOT cached — retrying will refetch all pages. (${diag})`,
+      );
     }
 
-    const raw = successfulPages.flatMap((p) => p.results);
+    // Every page succeeded — assemble the listing and cache it.
+    const raw = [
+      ...first.results,
+      ...rest.flatMap((r) =>
+        r.status === "fulfilled" ? r.value.results : [],
+      ),
+    ];
     const normalized = raw.map((r) => normalizePost(r, team));
 
     const out: ListingPayload = {
@@ -1151,58 +1209,122 @@ export function createClient(opts: ClientOptions = {}): Client {
       const contentHtml = raw.content ?? "";
       const contentText = htmlToText(contentHtml);
 
-      const enriched = await enrichPostEngagement(post, teamUserIds);
-
-      // Re-derive the post author role against the per-call team so
-      // post.author.role matches comments[].author.role for the SAME
-      // user under the SAME effective team. Without this, the cached
-      // post.author.role (computed at factory time with the default
-      // team) would disagree with the freshly-reclassified comment
-      // author role whenever a teamUserIds override is supplied.
       const {
-        team: effectiveTeamReclass,
+        team: effectiveTeam,
         configured: teamConfigured,
       } = resolveTeam(teamUserIds, team, hasTeam);
-      const enrichedWithAuthor = reclassifyPostAuthor(
-        enriched,
-        effectiveTeamReclass,
-        teamConfigured,
-      );
+      const teamOverride =
+        teamUserIds && teamUserIds.length > 0
+          ? new Set(teamUserIds)
+          : null;
 
+      // Single fetch per request.
+      //
+      // include_comments=false: use the lazy enrichPostEngagement path
+      // (still goes through getComments under the hood). This is the
+      // pre-existing behavior and triggers a comment fetch only when
+      // a team is configured.
+      //
+      // include_comments=true: fetch the comment thread EXACTLY ONCE,
+      // reclassify once, and derive BOTH engagement fields and the
+      // returned comments[] from that same classified tree. This
+      // prevents the previous bug where enrichPostEngagement fetched
+      // first (and may have set commentFetchFailed:true), then the
+      // comments block fetched AGAIN — letting the response end up
+      // with complete comments but a stale commentFetchFailed:true
+      // and missing engagement fields from the first attempt.
       if (!includeComments) {
+        const enriched = await enrichPostEngagement(post, teamUserIds);
+        const enrichedWithAuthor = reclassifyPostAuthor(
+          enriched,
+          effectiveTeam,
+          teamConfigured,
+        );
         return { ...enrichedWithAuthor, contentHtml, contentText };
       }
 
-      let comments: NormalizedComment[] | undefined;
-      let commentsError: string | undefined;
-      try {
-        // getComments always returns a role-neutral cached tree.
-        // Reclassify it against THIS request's effective team so the
-        // returned comments reflect the team set the caller asked for,
-        // not whatever team was active when the cache was last warmed.
-        // When no team is configured (override absent AND no default
-        // env-var team), pass configured=false so every author is
-        // "unknown" rather than fabricated as customer.
-        const neutral = await getComments(fetcher, cache, post.id);
-        comments = reclassifyTree(
-          neutral,
-          effectiveTeamReclass,
+      // include_comments=true — single fetch.
+      if (post.commentCount === 0) {
+        // No comments on this post: skip the fetch entirely, return
+        // the post with empty comments[]. Still reclassify the post
+        // author against the per-call team.
+        const enrichedWithAuthor = reclassifyPostAuthor(
+          post,
+          effectiveTeam,
           teamConfigured,
         );
+        return {
+          ...enrichedWithAuthor,
+          contentHtml,
+          contentText,
+          comments: [],
+        };
+      }
+
+      try {
+        const neutral = await getComments(fetcher, cache, post.id);
+        const classified = reclassifyTree(
+          neutral,
+          effectiveTeam,
+          teamConfigured,
+        );
+        // Derive engagement from the SAME classified tree the comments
+        // array comes from. No second fetch.
+        const engagement =
+          teamOverride && teamConfigured
+            ? computeEngagementWithTeamOverride(classified, teamOverride)
+            : teamConfigured
+              ? computeEngagement(classified)
+              : null; // no team → omit engagement fields
+        const withEngagement: NormalizedPost = engagement
+          ? { ...post, ...engagement }
+          : { ...post };
+        const enrichedWithAuthor = reclassifyPostAuthor(
+          withEngagement,
+          effectiveTeam,
+          teamConfigured,
+        );
+        return {
+          ...enrichedWithAuthor,
+          contentHtml,
+          contentText,
+          comments: classified,
+        };
       } catch (err) {
-        commentsError = err instanceof Error ? err.message : String(err);
+        // Atomic getComments() threw. Return ONE consistent failed
+        // state: commentsError set, comments array undefined,
+        // engagement fields OMITTED (not commentFetchFailed:true from
+        // a separate earlier attempt — there is no earlier attempt).
+        const commentsError =
+          err instanceof Error ? err.message : String(err);
         console.error(
           `[featurebase-mcp] comments fetch failed for ${slug}:`,
           err,
         );
+        // Strip any stale engagement fields that may have come from
+        // a previous successful-but-now-invalidated fetch (defensive —
+        // should not happen in production since the per-call reclassify
+        // is the only source).
+        const base: NormalizedPost = { ...post };
+        delete base.commentFetchFailed;
+        delete base.hasAdminReply;
+        delete base.adminReplyCount;
+        delete base.customerCommentCount;
+        delete base.lastCommentDate;
+        delete base.adminLastReplyDate;
+        delete base.customerLastReplyDate;
+        const withAuthor = reclassifyPostAuthor(
+          base,
+          effectiveTeam,
+          teamConfigured,
+        );
+        return {
+          ...withAuthor,
+          contentHtml,
+          contentText,
+          commentsError,
+        };
       }
-      return {
-        ...enrichedWithAuthor,
-        contentHtml,
-        contentText,
-        comments,
-        commentsError,
-      };
     },
 
     async getPosts(args: GetPostsArgs) {
@@ -1589,18 +1711,16 @@ export function createClient(opts: ClientOptions = {}): Client {
         };
       });
 
-      // Compute unused IDs when override was used
+      // Compute unused IDs when override was used. A failed comment
+      // fetch may have hidden one of the supplied IDs from `allMatched`
+      // — in that case we MUST NOT report that ID as unused, because
+      // we don't know. Track the failure count; if any required fetch
+      // failed, expose `unusedTeamUserIdsComplete: false` and omit the
+      // `unusedTeamUserIds` field entirely.
+      let unusedTeamUserIdsComplete: boolean | undefined;
       if (teamOverride) {
         const allMatched = new Set<string>();
-        for (const c of candidates) {
-          // Walk cached comments for this post? We don't have access here.
-          // Simplification: report unused as IDs that don't appear in the
-          // board-wide comment index (proxies for "appears in any thread").
-          // If commentCount === 0 for a post the user ID can't be in it.
-          // The visible "matched" set is approximated by the comment index
-          // which we built before the override took effect; we re-walk.
-        }
-        // Walk every with-comments post's cached comments to identify matched IDs.
+        let unusedFetchesFailed = 0;
         for (const p of all.normalized.filter((x) => x.commentCount > 0)) {
           try {
             const cs = await getComments(fetcher, cache, p.id);
@@ -1608,12 +1728,24 @@ export function createClient(opts: ClientOptions = {}): Client {
               if (teamOverride.has(c.author.userId))
                 allMatched.add(c.author.userId);
             });
-          } catch {}
+          } catch (err) {
+            unusedFetchesFailed++;
+            console.error(
+              `[featurebase-mcp] stalled-promises: comments fetch failed for ${p.slug} (unusedTeamUserIds):`,
+              err,
+            );
+          }
         }
-        const unused = [...teamOverride].filter(
-          (id) => !allMatched.has(id),
-        );
-        if (unused.length > 0) unusedTeamUserIds = unused;
+        unusedTeamUserIdsComplete = unusedFetchesFailed === 0;
+        if (unusedTeamUserIdsComplete) {
+          const unused = [...teamOverride].filter(
+            (id) => !allMatched.has(id),
+          );
+          if (unused.length > 0) unusedTeamUserIds = unused;
+        } else {
+          // Refuse to claim any ID is unused based on incomplete threads.
+          unusedTeamUserIds = undefined;
+        }
       }
 
       let engagementWarning: string | undefined;
@@ -1639,6 +1771,7 @@ export function createClient(opts: ClientOptions = {}): Client {
         teamSource,
         warning: finalWarning,
         unusedTeamUserIds,
+        unusedTeamUserIdsComplete,
         engagementComplete,
         failedCommentPostCount: failedPostSlugs.length || undefined,
         failedPostSlugs:
