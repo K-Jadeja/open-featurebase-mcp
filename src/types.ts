@@ -7,10 +7,10 @@
 /**
  * Role of an author on this Featurebase board.
  *
- * - "admin" — userId is in the configured team set (env var +
- *   /api/v1/organization admins)
- * - "customer" — team set is configured but this user is not in it
- * - "unknown" — no team set is configured at all (we cannot tell)
+ * - "admin" — userId is in the configured team set (FEATUREBASE_TEAM_USER_IDS
+ *   env var OR the teamUserIds override for the current call).
+ * - "customer" — team set is configured but this user is not in it.
+ * - "unknown" — no team set is configured at all (we cannot tell).
  *
  * When role is "unknown", engagement fields (hasAdminReply, etc.) are
  * omitted from `NormalizedPost` rather than set to false/0 — silent

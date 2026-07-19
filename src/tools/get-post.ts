@@ -23,12 +23,14 @@ export const GetPostArgsSchema = {
     .array(z.string().min(1))
     .optional()
     .describe(
-      "Optional override for the team-user-id set. When provided, comments " +
-        "(and engagement fields on the post) are re-classified using these " +
-        "IDs as the team — useful for drilling into a single thread after " +
-        "calling find_featurebase_user. With no env var configured AND no " +
-        "teamUserIds passed, comment authors will show role='unknown' and " +
-        "engagement fields will be omitted.",
+      "Optional override for the team-user-id set. When provided as a NON-EMPTY " +
+        "array, comments (and engagement fields on the post) are re-classified " +
+        "using these IDs as the team — useful for drilling into a single thread " +
+        "after calling find_featurebase_user. A non-empty override REPLACES the " +
+        "FEATUREBASE_TEAM_USER_IDS env var for this call only. An EMPTY array " +
+        "([]) is treated as ABSENT — the env var is used if configured. With no " +
+        "env var configured AND no teamUserIds passed, comment authors will show " +
+        "role='unknown' and engagement fields will be omitted.",
     ),
 };
 

@@ -27,17 +27,25 @@ export const ListPostsArgsSchema = {
     .describe(
       "When true, restrict to posts where the team has authored at least " +
         "one comment (hasAdminReply === true). When false, restrict to posts " +
-        "where the team has NOT commented. Requires FEATUREBASE_TEAM_USER_IDS " +
-        "to be set or the request will return empty (engagement classification " +
-        "is skipped when no team IDs are configured — see known limitations).",
+        "where the team has NOT commented. REQUIRES a team identity — if no " +
+        "team is available (FEATUREBASE_TEAM_USER_IDS unset AND no teamUserIds " +
+        "override supplied), the request FAILS with InvalidParams rather than " +
+        "silently returning an empty list. Fabricating hasAdminReply=false " +
+        "for every post would be a silent false-positive for callers asking " +
+        "for hasAdminReply:false, and a silent false-negative for callers " +
+        "asking for hasAdminReply:true. Call find_featurebase_user first to " +
+        "discover user IDs, then pass them as teamUserIds.",
     ),
   teamUserIds: z
     .array(z.string().min(1))
     .optional()
     .describe(
-      "Optional override for the team-user-id set. When provided, this " +
-        "list of IDs is treated as the team for hasAdminReply classification, " +
-        "shadowing the FEATUREBASE_TEAM_USER_IDS env var. Useful after a " +
+      "Optional override for the team-user-id set. When provided as a NON-EMPTY " +
+        "array, this list of IDs is treated as the team for hasAdminReply " +
+        "classification, REPLACING the FEATUREBASE_TEAM_USER_IDS env var for " +
+        "this call only. An EMPTY array ([]) is treated as ABSENT — the env " +
+        "var is used if configured, otherwise the request still fails with " +
+        "InvalidParams for hasAdminReply. Useful after a " +
         "find_featurebase_user drill-down — pass the returned userIds here to " +
         "filter the listing by team engagement without re-reading the env.",
     ),

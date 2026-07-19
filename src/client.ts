@@ -581,6 +581,17 @@ function normalizeCommentNeutral(raw: any): RoleNeutralComment {
  * requests with different `teamUserIds` overrides cannot contaminate
  * each other's classification — the cache holds only identity + body,
  * never a derived role.
+ *
+ * ## Atomic multi-page contract
+ *
+ * Multi-page comment retrieval is ATOMIC. If page 1 fails OR any later
+ * required page fails, this function throws ONE `McpError` whose message
+ * lists the failed page numbers — and the cache is NOT populated. A
+ * partial thread is never cached and never returned to callers as if it
+ * were complete. The previous implementation silently kept the fulfilled
+ * later pages and cached the partial thread, which corrupted
+ * `hasAdminReply`, admin/customer counts and last-reply dates,
+ * `totalCommentCount`, `engagementComplete`, and `commentsComplete`.
  */
 async function getComments(
   fetcher: Fetcher,
@@ -592,18 +603,52 @@ async function getComments(
   const cached = cache.get<RoleNeutralComment[]>(cacheKey);
   if (cached) return cached;
 
+  // Page 1 is fetched eagerly so we can learn totalPages. A failure
+  // here is the most catastrophic (no part of the thread is usable),
+  // so it bubbles up directly. The fetchCommentsPage helper already
+  // throws McpError on non-2xx, so we don't need extra wrapping.
   const first = await fetchCommentsPage(fetcher, submissionId, 1);
   const totalPages = first.totalPages;
+
+  // Pages 2..N fetched concurrently. Promise.allSettled lets us inspect
+  // each page's outcome independently — the previous implementation
+  // dropped rejected pages silently, which is exactly the bug we're
+  // fixing here.
   const rest = await Promise.allSettled(
     Array.from({ length: Math.max(0, totalPages - 1) }, (_, i) =>
       fetchCommentsPage(fetcher, submissionId, i + 2),
     ),
   );
+
+  // Collect failed later pages. The page number reported is the
+  // 1-indexed pagination index (so the message is "failed pages: 2, 4"
+  // not "indices 0, 2").
+  const failedPages = rest
+    .map((r, i) => ({ r, page: i + 2 }))
+    .filter(({ r }) => r.status === "rejected");
+  if (failedPages.length > 0) {
+    // Use the first rejection's error message as a representative
+    // diagnostic. We don't echo the full stack to avoid leaking
+    // internal implementation detail; callers can re-fetch and inspect
+    // their own logs.
+    const firstError =
+      failedPages[0]!.r.status === "rejected" ? failedPages[0]!.r.reason : null;
+    const diag =
+      firstError instanceof Error ? firstError.message : String(firstError ?? "");
+    throw new McpError(
+      ErrorCode.InternalError,
+      `Incomplete comment thread for ${submissionId}: failed pages ` +
+        `${failedPages.map((f) => f.page).join(", ")} of ${totalPages}. ` +
+        `Thread NOT cached — retrying will refetch all pages. (${diag})`,
+    );
+  }
+
+  // Every page succeeded — safe to assemble the tree and cache it.
   const allRaw = [
     ...first.results,
-    ...rest
-      .filter((r): r is PromiseFulfilledResult<CommentsApiResponse> => r.status === "fulfilled")
-      .flatMap((r) => r.value.results),
+    ...rest.flatMap((r) =>
+      r.status === "fulfilled" ? r.value.results : [],
+    ),
   ];
 
   const tree: RoleNeutralComment[] = allRaw.map((r) =>
@@ -1051,8 +1096,11 @@ export function createClient(opts: ClientOptions = {}): Client {
             `${failedPostSlugs.length} post(s) (${failedPostSlugs.slice(0, 5).join(", ")}` +
             (failedPostSlugs.length > 5 ? ", …" : "") +
             `). Their hasAdminReply value is reported as commentFetchFailed=true ` +
-            `and they may have been excluded from posts[]. Re-run after a few minutes ` +
-            `to retry, or remove them from the board and call again.`;
+            `and they may have been excluded from posts[]. This is a transient ` +
+            `API failure (network, rate-limit, or service hiccup). Retry the ` +
+            `request after a short delay; check network connectivity and the ` +
+            `Featurebase board status if the failure persists. Do NOT delete ` +
+            `or modify the affected posts — they are still user-visible content.`;
         }
       }
 
@@ -1334,11 +1382,22 @@ export function createClient(opts: ClientOptions = {}): Client {
 
       // For the user-friendly "stalled" semantic, we need per-post
       // adminLastReplyDate/customerLastReplyDate, which means fetching
-      // comments. Build the index lazily (cached after first call).
-      // Even if every fetch fails, index.counts.size may be 0 — we must
-      // still run the candidate-enrichment loop so the failed posts
-      // surface in failedPostSlugs and engagementComplete=false.
-      const index = await ensureCommentIndex();
+      // comments. The candidate loop below fetches each post's comments
+      // directly via getComments() — we intentionally do NOT call
+      // ensureCommentIndex() here, because:
+      //   (a) The index is unused in this code path (the candidate
+      //       loop produces its own engagement per post).
+      //   (b) Calling ensureCommentIndex() here would cache a board-wide
+      //       user-count map under "comments:index" — and if any
+      //       multi-page comment fetch threw ATOMICALLY, the index
+      //       would be cached with incomplete counts. A later
+      //       find_featurebase_user call would then consume stale
+      //       incomplete counts from that cache, polluting
+      //       totalCommentCount across requests.
+      // Leaving the index alone means find-user builds its own counts
+      // (via ensureCommentIndex or per-post getComments) on demand,
+      // after the candidate loop has fully populated or rejected each
+      // per-post cache entry.
 
       let candidates = all.normalized.slice();
 
@@ -1352,15 +1411,32 @@ export function createClient(opts: ClientOptions = {}): Client {
       // No conditional gate: if teamConfigured is true (the no-team
       // branch above already returned), every comment-bearing post
       // is fetched and classified. Failures must be observable.
+      //
+      // The CandidateResult is a discriminated union on `kind`:
+      //   - "no_comments" : post has zero comments per listing;
+      //                     engagement fields stay absent (we cannot
+      //                     claim hasAdminReply one way or the other
+      //                     when there are no comments).
+      //   - "fetched"     : comments were fetched and classified;
+      //                     engagement fields are populated.
+      //   - "failed"      : atomic getComments() threw; this post is
+      //                     marked commentFetchFailed and surfaces in
+      //                     failedPostSlugs / engagementComplete=false.
       type CandidateResult =
-        | { p: NormalizedPost; slug: string; ok: true; eng: EngagementFields }
-        | { p: NormalizedPost; slug: string; ok: false };
+        | { kind: "no_comments"; p: NormalizedPost; slug: string }
+        | {
+            kind: "fetched";
+            p: NormalizedPost;
+            slug: string;
+            eng: EngagementFields;
+          }
+        | { kind: "failed"; p: NormalizedPost; slug: string };
       candidates = await mapWithConcurrency(
         candidates,
         COMMENTS_CONCURRENCY,
         async (p): Promise<CandidateResult> => {
           if (p.commentCount === 0) {
-            return { p, slug: p.slug, ok: true, eng: {} as EngagementFields };
+            return { kind: "no_comments", p, slug: p.slug };
           }
           try {
             const neutral = await getComments(fetcher, cache, p.id);
@@ -1368,23 +1444,27 @@ export function createClient(opts: ClientOptions = {}): Client {
             const eng = teamOverride
               ? computeEngagementWithTeamOverride(classified, teamOverride)
               : computeEngagement(classified);
-            return { p, slug: p.slug, ok: true, eng };
+            return { kind: "fetched", p, slug: p.slug, eng };
           } catch (err) {
             console.error(
               `[featurebase-mcp] stalled-promises: comments fetch failed for ${p.slug}:`,
               err,
             );
-            return { p, slug: p.slug, ok: false };
+            return { kind: "failed", p, slug: p.slug };
           }
         },
       ).then((resolved) =>
         resolved.map((r) => {
-          if (r.ok) {
-            return { ...r.p, ...r.eng };
+          switch (r.kind) {
+            case "no_comments":
+              return r.p;
+            case "fetched":
+              return { ...r.p, ...r.eng };
+            case "failed":
+              failedPostSlugs.push(r.slug);
+              engagementComplete = false;
+              return { ...r.p, commentFetchFailed: true };
           }
-          failedPostSlugs.push(r.slug);
-          engagementComplete = false;
-          return { ...r.p, commentFetchFailed: true };
         }),
       );
 
@@ -1543,8 +1623,11 @@ export function createClient(opts: ClientOptions = {}): Client {
           `${failedPostSlugs.length} post(s) (${failedPostSlugs.slice(0, 5).join(", ")}` +
           (failedPostSlugs.length > 5 ? ", …" : "") +
           `). Their admin/customer dates are unknown and they may have been ` +
-          `excluded from promises[]. Re-run after a few minutes to retry, or ` +
-          `remove them from the board and call again.`;
+          `excluded from promises[]. This is a transient API failure (network, ` +
+          `rate-limit, or service hiccup). Retry the request after a short ` +
+          `delay; check network connectivity and the Featurebase board status ` +
+          `if the failure persists. Do NOT delete or modify the affected posts ` +
+          `— they are still user-visible content.`;
       }
       // Merge the partial-failure warning with any pre-existing warning
       // (currently only the no-team branch — but that branch has its own

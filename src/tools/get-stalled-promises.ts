@@ -24,12 +24,14 @@ export const GetStalledPromisesArgsSchema = {
     .array(z.string().min(1))
     .optional()
     .describe(
-      "Optional override for the team-user-id set. When provided, these " +
-        "IDs are used instead of (or in addition to) the FEATUREBASE_TEAM_USER_IDS " +
-        "env var + /api/v1/organization admins. Use this together with " +
+      "Optional override for the team-user-id set. When provided as a NON-EMPTY " +
+        "array, these IDs REPLACE the FEATUREBASE_TEAM_USER_IDS env var for " +
+        "this call only — the env var is ignored. Use this together with " +
         "find_featurebase_user to run a stalled-promise query without " +
-        "env-var configuration. Engagement fields are re-computed on the " +
-        "fly from cached comments using this set.",
+        "env-var configuration. An EMPTY array ([]) is treated as ABSENT — " +
+        "the env var team is used if configured; otherwise stalled-promises " +
+        "returns immediately with teamSource='none' and a warning. Engagement " +
+        "fields are re-computed on the fly from cached comments using this set.",
     ),
   status: z
     .array(z.enum(["open", "in_review", "planned", "in_progress", "completed"]))
