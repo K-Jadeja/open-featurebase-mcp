@@ -8,6 +8,20 @@
  * Importing this module is side-effect-free; it does NOT start the
  * transport. Callers (typically `src/index.ts`) do that explicitly.
  *
+ * ## Client lifecycle
+ *
+ * Each `buildServer()` call constructs exactly ONE `Client` instance
+ * (unless one is injected via the `client` option) and threads it into
+ * all seven tool handler factories. Tool modules do NOT instantiate
+ * clients at import time, so:
+ *
+ *   - Two `buildServer()` calls produce two independent clients with
+ *     two independent caches.
+ *   - Tests can inject a fake/mock client to exercise the MCP layer
+ *     without network access.
+ *   - The production server's request path exactly mirrors a test that
+ *     uses the same DI shape, so perf and behavior claims are honest.
+ *
  * ## Known limitations
  *
  * McpServer's `validateToolInput` is marked `@private` in the SDK
@@ -35,13 +49,21 @@ import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { formatZodIssue } from "./validation.js";
-import { listPosts, ListPostsArgsSchema } from "./tools/list-posts.js";
-import { getPost, GetPostArgsSchema } from "./tools/get-post.js";
-import { getPosts, GetPostsArgsSchema } from "./tools/get-posts.js";
-import { searchPosts, SearchPostsArgsSchema } from "./tools/search-posts.js";
-import { getStats, GetStatsArgsSchema } from "./tools/get-stats.js";
-import { getStalledPromises, GetStalledPromisesArgsSchema } from "./tools/get-stalled-promises.js";
-import { findUser, FindUserArgsSchema } from "./tools/find-user.js";
+import { createClient, type Client } from "./client.js";
+import { ListPostsArgsSchema } from "./tools/list-posts.js";
+import { createListPostsHandler } from "./tools/list-posts.js";
+import { GetPostArgsSchema } from "./tools/get-post.js";
+import { createGetPostHandler } from "./tools/get-post.js";
+import { GetPostsArgsSchema } from "./tools/get-posts.js";
+import { createGetPostsHandler } from "./tools/get-posts.js";
+import { SearchPostsArgsSchema } from "./tools/search-posts.js";
+import { createSearchPostsHandler } from "./tools/search-posts.js";
+import { GetStatsArgsSchema } from "./tools/get-stats.js";
+import { createGetStatsHandler } from "./tools/get-stats.js";
+import { GetStalledPromisesArgsSchema } from "./tools/get-stalled-promises.js";
+import { createGetStalledPromisesHandler } from "./tools/get-stalled-promises.js";
+import { FindUserArgsSchema } from "./tools/find-user.js";
+import { createFindUserHandler } from "./tools/find-user.js";
 
 /**
  * Validate raw input against a strict Zod schema at the MCP tool
@@ -61,13 +83,30 @@ function validateArgs<S extends z.ZodTypeAny>(
 }
 
 /**
+ * Options for buildServer.
+ *
+ * `client` is injected primarily for testing — production callers can
+ * omit it and a fresh `createClient()` is constructed for this server.
+ * Two independent `buildServer()` calls always produce two independent
+ * Client instances (whether the caller injects them or lets them be
+ * default-constructed).
+ */
+export interface BuildServerOptions {
+  client?: Client;
+}
+
+/**
  * Build the FeaturebaseMcpServer — registers all 7 tools with their
  * real ZodObject schemas (preserving descriptions, defaults, bounds,
  * enums), installs the request-scoped validator, returns the server.
  *
  * Call `await server.connect(transport)` after this.
  */
-export function buildServer(): McpServer {
+export function buildServer(opts: BuildServerOptions = {}): McpServer {
+  // One client per server. This is the ONLY client these seven tools
+  // share. If a test injects its own, that is its tests' single client;
+  // if the caller omits `client`, a fresh one is built now.
+  const client = opts.client ?? createClient();
   const server = new McpServer({
     name: "featurebase-mcp",
     version: "1.0.0",
@@ -91,7 +130,9 @@ export function buildServer(): McpServer {
   };
 
   // Each tool registered with its REAL ZodObject inputSchema so
-  // listTools advertises a full schema (types, defaults, bounds).
+  // listTools advertises a full schema (types, defaults, bounds). The
+  // handler is a closure returned by a per-tool factory bound to the
+  // single shared `client` above.
   server.registerTool(
     "list_featurebase_posts",
     {
@@ -99,7 +140,7 @@ export function buildServer(): McpServer {
         "List posts on the configured Featurebase feedback board.",
       inputSchema: z.object(ListPostsArgsSchema),
     },
-    (args) => listPosts(args as Parameters<typeof listPosts>[0]),
+    (args) => createListPostsHandler(client)(args as Parameters<ReturnType<typeof createListPostsHandler>>[0]),
   );
 
   server.registerTool(
@@ -109,7 +150,7 @@ export function buildServer(): McpServer {
         "Get a single post by slug, optionally with full comment thread.",
       inputSchema: z.object(GetPostArgsSchema),
     },
-    (args) => getPost(args as Parameters<typeof getPost>[0]),
+    (args) => createGetPostHandler(client)(args as Parameters<ReturnType<typeof createGetPostHandler>>[0]),
   );
 
   server.registerTool(
@@ -118,7 +159,7 @@ export function buildServer(): McpServer {
       description: "Batch-fetch multiple posts by slug array.",
       inputSchema: z.object(GetPostsArgsSchema),
     },
-    (args) => getPosts(args as Parameters<typeof getPosts>[0]),
+    (args) => createGetPostsHandler(client)(args as Parameters<ReturnType<typeof createGetPostsHandler>>[0]),
   );
 
   server.registerTool(
@@ -127,7 +168,7 @@ export function buildServer(): McpServer {
       description: "Search posts by keyword over title + body.",
       inputSchema: z.object(SearchPostsArgsSchema),
     },
-    (args) => searchPosts(args as Parameters<typeof searchPosts>[0]),
+    (args) => createSearchPostsHandler(client)(args as Parameters<ReturnType<typeof createSearchPostsHandler>>[0]),
   );
 
   server.registerTool(
@@ -136,7 +177,7 @@ export function buildServer(): McpServer {
       description: "Board-wide statistics and aggregates.",
       inputSchema: z.object(GetStatsArgsSchema),
     },
-    (args) => getStats(args as Parameters<typeof getStats>[0]),
+    (args) => createGetStatsHandler(client)(args as Parameters<ReturnType<typeof createGetStatsHandler>>[0]),
   );
 
   server.registerTool(
@@ -147,7 +188,9 @@ export function buildServer(): McpServer {
       inputSchema: z.object(GetStalledPromisesArgsSchema),
     },
     (args) =>
-      getStalledPromises(args as Parameters<typeof getStalledPromises>[0]),
+      createGetStalledPromisesHandler(client)(
+        args as Parameters<ReturnType<typeof createGetStalledPromisesHandler>>[0],
+      ),
   );
 
   server.registerTool(
@@ -156,7 +199,7 @@ export function buildServer(): McpServer {
       description: "Look up user IDs by partial name match.",
       inputSchema: z.object(FindUserArgsSchema),
     },
-    (args) => findUser(args as Parameters<typeof findUser>[0]),
+    (args) => createFindUserHandler(client)(args as Parameters<ReturnType<typeof createFindUserHandler>>[0]),
   );
 
   return server;

@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { createClient } from "../client.js";
-const client = createClient();
+import type { Client } from "../client.js";
 
 export const GetPostArgsSchema = {
   slug: z
@@ -33,18 +32,25 @@ export const GetPostArgsSchema = {
     ),
 };
 
-export async function getPost(args: {
+export type GetPostArgs = {
   slug: string;
   include_comments: boolean;
   teamUserIds?: string[];
-}) {
-  const post = await client.getPost(args.slug, args.include_comments, args.teamUserIds);
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(post, null, 2),
-      },
-    ],
+};
+
+/**
+ * Factory: bind the get-post MCP handler to a specific Client instance.
+ */
+export function createGetPostHandler(client: Client) {
+  return async function getPost(args: GetPostArgs) {
+    const post = await client.getPost(args.slug, args.include_comments, args.teamUserIds);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(post, null, 2),
+        },
+      ],
+    };
   };
 }

@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { createClient } from "../client.js";
-const client = createClient();
+import type { Client } from "../client.js";
 
 export const FindUserArgsSchema = {
   name: z
@@ -27,14 +26,21 @@ export const FindUserArgsSchema = {
     ),
 };
 
-export async function findUser(args: { name: string; sampleSize: number }) {
-  const result = await client.findUser(args);
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(result, null, 2),
-      },
-    ],
+export type FindUserArgs = { name: string; sampleSize: number };
+
+/**
+ * Factory: bind the find-user MCP handler to a specific Client instance.
+ */
+export function createFindUserHandler(client: Client) {
+  return async function findUser(args: FindUserArgs) {
+    const result = await client.findUser(args);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+    };
   };
 }

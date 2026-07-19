@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { createClient } from "../client.js";
-const client = createClient();
+import type { Client } from "../client.js";
 
 export const GetStatsArgsSchema = {
   topVotedLimit: z
@@ -18,22 +17,24 @@ export const GetStatsArgsSchema = {
     .min(1)
     .max(50)
     .default(5)
-    .describe(
-      "How many posts to return in recent. Default 5, max 50.",
-    ),
+    .describe("How many posts to return in recent. Default 5, max 50."),
 };
 
-export async function getStats(args: {
-  topVotedLimit: number;
-  recentLimit: number;
-}) {
-  const stats = await client.getStats(args);
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(stats, null, 2),
-      },
-    ],
+export type GetStatsArgs = { topVotedLimit: number; recentLimit: number };
+
+/**
+ * Factory: bind the get-stats MCP handler to a specific Client instance.
+ */
+export function createGetStatsHandler(client: Client) {
+  return async function getStats(args: GetStatsArgs) {
+    const stats = await client.getStats(args);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(stats, null, 2),
+        },
+      ],
+    };
   };
 }

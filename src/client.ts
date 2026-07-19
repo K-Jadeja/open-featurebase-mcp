@@ -63,15 +63,27 @@ const TTL = {
 } as const;
 
 /**
- * Comma-separated Featurebase user IDs considered team/admin for role
- * tagging. Falls back to empty when unset.
+ * Read the team-user-ids env var at factory invocation time (not at
+ * module load). Each createClient() call gets its own snapshot of
+ * the env, so tests can override FEATUREBASE_TEAM_USER_IDS before
+ * constructing a client and that override is honored.
  */
-const TEAM_USER_IDS: Set<string> = new Set(
-  (process.env.FEATUREBASE_TEAM_USER_IDS ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean),
-);
+function readTeamUserIds(): ReadonlySet<string> {
+  return new Set(
+    (process.env.FEATUREBASE_TEAM_USER_IDS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
+
+/**
+ * Module-level default for code paths that don't have a Client
+ * instance handy (e.g. early static normalizers). Production code
+ * always uses the per-factory snapshot — this default exists only
+ * so module-level helpers compile.
+ */
+const TEAM_USER_IDS_DEFAULT: ReadonlySet<string> = readTeamUserIds();
 
 // ---------------------------------------------------------------------------
 // Cache (Map + timestamps; one entry per factory instance)
@@ -144,7 +156,7 @@ function normalizeAuthorBasic(raw: any): Omit<NormalizedAuthor, "role"> {
 
 /** Effective team set. */
 function getTeamSet(): ReadonlySet<string> {
-  return TEAM_USER_IDS;
+  return TEAM_USER_IDS_DEFAULT;
 }
 
 /** Decide role for an author. */
@@ -468,13 +480,13 @@ async function getComments(
   fetcher: Fetcher,
   cache: ReturnType<typeof makeCache>,
   submissionId: string,
+  team: ReadonlySet<string>,
 ): Promise<NormalizedComment[]> {
   if (!submissionId) return [];
   const cacheKey = `comments:${submissionId}`;
   const cached = cache.get<NormalizedComment[]>(cacheKey);
   if (cached) return cached;
 
-  const team = getTeamSet();
   const first = await fetchCommentsPage(fetcher, submissionId, 1);
   const totalPages = first.totalPages;
   const rest = await Promise.allSettled(
@@ -619,6 +631,7 @@ export interface ListPostsArgs {
   sortBy: "date:desc" | "date:asc" | "upvotes:desc";
   limit: number;
   hasAdminReply?: boolean;
+  teamUserIds?: string[];
 }
 
 export interface SearchPostsArgs {
@@ -677,6 +690,11 @@ interface StalledPromise {
 export function createClient(opts: ClientOptions = {}): Client {
   const fetcher = opts.fetcher ?? createFetcher();
   const cache = makeCache();
+  // Per-factory team snapshot, evaluated once when the client is
+  // constructed. Subsequent env-var changes do NOT affect an existing
+  // client (intentional — caches depend on team set).
+  const team: ReadonlySet<string> = readTeamUserIds();
+  const hasTeam = team.size > 0;
 
   /**
    * Lazy board-wide comment index. Built on first call to a tool that
@@ -709,7 +727,7 @@ export function createClient(opts: ClientOptions = {}): Client {
         COMMENTS_CONCURRENCY,
         async (p) => {
           try {
-            const comments = await getComments(fetcher, cache, p.id);
+            const comments = await getComments(fetcher, cache, p.id, team);
             return { id: p.id, ok: true as const, comments };
           } catch (err) {
             console.error(
@@ -761,7 +779,6 @@ export function createClient(opts: ClientOptions = {}): Client {
     }
 
     const raw = successfulPages.flatMap((p) => p.results);
-    const team = getTeamSet();
     const normalized = raw.map((r) => normalizePost(r, team));
 
     const out: ListingPayload = {
@@ -788,8 +805,7 @@ export function createClient(opts: ClientOptions = {}): Client {
         ? new Set(teamUserIds)
         : null;
     try {
-      const comments = await getComments(fetcher, cache, post.id);
-      const team = teamOverride ?? getTeamSet();
+      const comments = await getComments(fetcher, cache, post.id, team);
       const eng = teamOverride
         ? computeEngagementWithTeamOverride(comments, teamOverride)
         : computeEngagement(comments);
@@ -809,9 +825,71 @@ export function createClient(opts: ClientOptions = {}): Client {
         posts = posts.filter((p) => p.status.type === want);
       }
 
+      // hasAdminReply requires per-post engagement fields, which means
+      // we have to fetch comments for posts that have any. Lazy: only
+      // triggered when the caller actually asks for the filter.
       if (args.hasAdminReply !== undefined) {
-        // Only meaningful if engagement is classified; absent engagement
-        // fields return false, which won't match either filter.
+        // The caller may pass teamUserIds as an override (useful for
+        // tests and for the find_featurebase_user → list_featurebase_posts
+        // drill-down). When provided, it shadows the env-var team set.
+        const teamOverride =
+          args.teamUserIds && args.teamUserIds.length > 0
+            ? new Set(args.teamUserIds)
+            : null;
+        const effectiveTeam = teamOverride ?? team;
+        const effectiveHasTeam = effectiveTeam.size > 0;
+        if (!effectiveHasTeam) {
+          // Without a team set, role classification is impossible.
+          // Per the audit: silent classification would be worse than
+          // returning empty + a clear warning. Surface it via a
+          // synthetic warning field attached to each returned post.
+          const warning =
+            "hasAdminReply filter requires FEATUREBASE_TEAM_USER_IDS " +
+            "or a teamUserIds override. Set the env var, or call " +
+            "find_featurebase_user to discover your user IDs.";
+          posts = posts.map((p) =>
+            p.commentCount > 0
+              ? { ...p, hasAdminReply: false, hasAdminReplyWarning: warning }
+              : { ...p, hasAdminReply: false, hasAdminReplyWarning: warning },
+          );
+        } else {
+          const withComments = posts.filter(
+            (p) => p.commentCount > 0 && !p.commentFetchFailed,
+          );
+          const enriched = await mapWithConcurrency(
+            withComments,
+            COMMENTS_CONCURRENCY,
+            async (p) => {
+              try {
+                const comments = await getComments(
+                  fetcher,
+                  cache,
+                  p.id,
+                  effectiveTeam,
+                );
+                const eng = teamOverride
+                  ? computeEngagementWithTeamOverride(comments, teamOverride)
+                  : computeEngagement(comments);
+                return { id: p.id, eng };
+              } catch {
+                return { id: p.id, eng: undefined };
+              }
+            },
+          );
+          const engById = new Map<string, EngagementFields | undefined>();
+          for (const e of enriched) engById.set(e.id, e.eng);
+
+          posts = posts.map((p) => {
+            const eng = engById.get(p.id);
+            if (eng === undefined) {
+              return p.commentCount > 0
+                ? { ...p, commentFetchFailed: true }
+                : p;
+            }
+            return { ...p, ...eng };
+          });
+        }
+
         posts = posts.filter(
           (p) => (p.hasAdminReply ?? null) === args.hasAdminReply,
         );
@@ -854,7 +932,7 @@ export function createClient(opts: ClientOptions = {}): Client {
       let comments: NormalizedComment[] | undefined;
       let commentsError: string | undefined;
       try {
-        const rawComments = await getComments(fetcher, cache, post.id);
+        const rawComments = await getComments(fetcher, cache, post.id, team);
         comments = teamUserIds
           ? reclassifyTree(rawComments, new Set(teamUserIds), true)
           : rawComments;
@@ -1023,14 +1101,11 @@ export function createClient(opts: ClientOptions = {}): Client {
       let warning: string | undefined;
       let unusedTeamUserIds: string[] | undefined;
 
-      if (!teamOverride) {
-        const team = getTeamSet();
-        if (team.size === 0) {
-          warning =
-            "No team IDs configured — stalled-promise detection requires knowing who your team is. " +
+      if (!teamOverride && !hasTeam) {
+        warning =
+          "No team IDs configured — stalled-promise detection requires knowing who your team is. " +
             "Call find_featurebase_user with your name to discover your user ID, then pass the " +
             "returned userIds as teamUserIds. Alternatively set FEATUREBASE_TEAM_USER_IDS env var.";
-        }
       }
 
       // For the user-friendly "stalled" semantic, we need per-post
@@ -1050,8 +1125,7 @@ export function createClient(opts: ClientOptions = {}): Client {
             // We need per-post dates, so fetch the post's comments.
             if (p.commentCount === 0) return { p, eng: undefined };
             try {
-              const comments = await getComments(fetcher, cache, p.id);
-              const team = teamOverride ?? getTeamSet();
+              const comments = await getComments(fetcher, cache, p.id, team);
               const eng = teamOverride
                 ? computeEngagementWithTeamOverride(comments, teamOverride)
                 : computeEngagement(comments);
@@ -1107,8 +1181,7 @@ export function createClient(opts: ClientOptions = {}): Client {
         let lastAdminMsg: StalledPromise["lastAdminMessage"] = null;
         let lastCustomerMsg: StalledPromise["lastCustomerMessage"] = null;
         try {
-          const comments = await getComments(fetcher, cache, p.id);
-          const team = teamOverride ?? getTeamSet();
+          const comments = await getComments(fetcher, cache, p.id, team);
           const adminPredicate = teamOverride
             ? (c: NormalizedComment) => teamOverride.has(c.author.userId)
             : (c: NormalizedComment) => c.author.role === "admin";
@@ -1190,7 +1263,7 @@ export function createClient(opts: ClientOptions = {}): Client {
         // Walk every with-comments post's cached comments to identify matched IDs.
         for (const p of all.normalized.filter((x) => x.commentCount > 0)) {
           try {
-            const cs = await getComments(fetcher, cache, p.id);
+            const cs = await getComments(fetcher, cache, p.id, team);
             walkComments(cs, (c) => {
               if (teamOverride.has(c.author.userId))
                 allMatched.add(c.author.userId);
@@ -1267,7 +1340,7 @@ export function createClient(opts: ClientOptions = {}): Client {
 
       for (const p of samplePosts) {
         try {
-          const comments = await getComments(fetcher, cache, p.id);
+          const comments = await getComments(fetcher, cache, p.id, team);
           walkComments(comments, (c) => {
             if (!c.author.name.toLowerCase().includes(lower)) return;
             const existing = matches.get(c.author.userId);

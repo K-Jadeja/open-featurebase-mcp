@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { createClient } from "../client.js";
-const client = createClient();
+import type { Client } from "../client.js";
 
 export const GetPostsArgsSchema = {
   slugs: z
@@ -22,17 +21,24 @@ export const GetPostsArgsSchema = {
     ),
 };
 
-export async function getPosts(args: { slugs: string[]; include_content: boolean }) {
-  const result = await client.getPosts({
-    slugs: args.slugs,
-    include_content: args.include_content,
-  });
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(result, null, 2),
-      },
-    ],
+export type GetPostsArgs = { slugs: string[]; include_content: boolean };
+
+/**
+ * Factory: bind the get-posts MCP handler to a specific Client instance.
+ */
+export function createGetPostsHandler(client: Client) {
+  return async function getPosts(args: GetPostsArgs) {
+    const result = await client.getPosts({
+      slugs: args.slugs,
+      include_content: args.include_content,
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+    };
   };
 }

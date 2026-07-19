@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { createClient } from "../client.js";
-const client = createClient();
+import type { Client } from "../client.js";
 
 export const SearchPostsArgsSchema = {
   query: z
@@ -18,14 +17,21 @@ export const SearchPostsArgsSchema = {
     .describe("Maximum number of results to return (1-50)."),
 };
 
-export async function searchPosts(args: { query: string; limit: number }) {
-  const result = await client.searchPosts(args);
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(result, null, 2),
-      },
-    ],
+export type SearchPostsArgs = { query: string; limit: number };
+
+/**
+ * Factory: bind the search-posts MCP handler to a specific Client instance.
+ */
+export function createSearchPostsHandler(client: Client) {
+  return async function searchPosts(args: SearchPostsArgs) {
+    const result = await client.searchPosts(args);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+    };
   };
 }

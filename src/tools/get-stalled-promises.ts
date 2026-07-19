@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { createClient } from "../client.js";
-const client = createClient();
+import type { Client } from "../client.js";
 
 export const GetStalledPromisesArgsSchema = {
   minDaysSinceAdminReply: z
@@ -53,20 +52,27 @@ export const GetStalledPromisesArgsSchema = {
     ),
 };
 
-export async function getStalledPromises(args: {
+export type GetStalledPromisesArgs = {
   minDaysSinceAdminReply: number;
   limit: number;
   teamUserIds?: string[];
   status?: Array<"open" | "in_review" | "planned" | "in_progress" | "completed">;
   sortBy: "staleness" | "freshness" | "upvotes";
-}) {
-  const result = await client.getStalledPromises(args);
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(result, null, 2),
-      },
-    ],
+};
+
+/**
+ * Factory: bind the stalled-promises MCP handler to a specific Client instance.
+ */
+export function createGetStalledPromisesHandler(client: Client) {
+  return async function getStalledPromises(args: GetStalledPromisesArgs) {
+    const result = await client.getStalledPromises(args);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+    };
   };
 }
