@@ -366,6 +366,13 @@ function walkComments(
  * rebuild a new tree with `role` assigned against THIS request's team
  * set. The cached tree is never mutated, so two requests with different
  * `teamUserIds` overrides see independent classifications.
+ *
+ * `configured` controls the loud-failure contract:
+ *   - true  → every author is admin iff in `team`, else customer.
+ *   - false → every author is "unknown" (team set unavailable; we
+ *             refuse to classify). Engagement fields MUST be omitted
+ *             when this is returned; the audit forbids manufacturing
+ *             customer/admin classification with no team reference.
  */
 function reclassifyTree(
   comments: RoleNeutralComment[],
@@ -387,6 +394,29 @@ function reclassifyTree(
     parentId: c.parentId,
     replies: reclassifyTree(c.replies, team, configured),
   }));
+}
+
+/**
+ * Resolve the effective team set + configured flag for a single call,
+ * given the per-call override (or null) and the factory-time default
+ * team set. Used by every engagement path so the override and the
+ * default env-var team share one consistent treatment.
+ *
+ *   - explicit non-empty override: team wins, configured=true.
+ *   - no override, default env-var team present: default wins, configured=true.
+ *   - no override, no default team: empty team, configured=false (→ unknown).
+ *   - empty override []: treated as absent (see #67 in audit history).
+ */
+function resolveTeam(
+  teamUserIds: string[] | undefined,
+  defaultTeam: ReadonlySet<string>,
+  defaultHasTeam: boolean,
+): { team: ReadonlySet<string>; configured: boolean } {
+  const override =
+    teamUserIds && teamUserIds.length > 0 ? new Set(teamUserIds) : null;
+  const team = override ?? defaultTeam;
+  const configured = override !== null || defaultHasTeam;
+  return { team, configured };
 }
 
 // ---------------------------------------------------------------------------
@@ -844,17 +874,24 @@ export function createClient(opts: ClientOptions = {}): Client {
     teamUserIds?: string[],
   ): Promise<NormalizedPost> {
     if (post.commentCount === 0 || post.commentFetchFailed) return post;
+    const { team: effectiveTeam, configured: teamConfigured } = resolveTeam(
+      teamUserIds,
+      team,
+      hasTeam,
+    );
+    if (!teamConfigured) {
+      // No team reference at all — refuse to manufacture classification.
+      // Return the post without any engagement fields; the loud-failure
+      // contract says unknown must remain unknown.
+      return post;
+    }
     const teamOverride =
       teamUserIds && teamUserIds.length > 0
         ? new Set(teamUserIds)
         : null;
     try {
       const neutral = await getComments(fetcher, cache, post.id);
-      const classified = reclassifyTree(
-        neutral,
-        teamOverride ?? team,
-        teamOverride !== null,
-      );
+      const classified = reclassifyTree(neutral, effectiveTeam, true);
       const eng = teamOverride
         ? computeEngagementWithTeamOverride(classified, teamOverride)
         : computeEngagement(classified);
@@ -1033,11 +1070,19 @@ export function createClient(opts: ClientOptions = {}): Client {
         // Reclassify it against THIS request's effective team so the
         // returned comments reflect the team set the caller asked for,
         // not whatever team was active when the cache was last warmed.
+        // When no team is configured (override absent AND no default
+        // env-var team), pass configured=false so every author is
+        // "unknown" rather than fabricated as customer.
         const neutral = await getComments(fetcher, cache, post.id);
-        const effectiveTeamReclass = teamUserIds
-          ? new Set(teamUserIds)
-          : team;
-        comments = reclassifyTree(neutral, effectiveTeamReclass, true);
+        const {
+          team: effectiveTeamReclass,
+          configured: teamConfigured,
+        } = resolveTeam(teamUserIds, team, hasTeam);
+        comments = reclassifyTree(
+          neutral,
+          effectiveTeamReclass,
+          teamConfigured,
+        );
       } catch (err) {
         commentsError = err instanceof Error ? err.message : String(err);
         console.error(
@@ -1199,15 +1244,31 @@ export function createClient(opts: ClientOptions = {}): Client {
       const teamSource: "override" | "default" = teamOverride
         ? "override"
         : "default";
+      const effectiveTeam = teamOverride ?? team;
 
       let warning: string | undefined;
       let unusedTeamUserIds: string[] | undefined;
 
+      // Short-circuit when no team reference is available. Without a
+      // team, we cannot classify admin vs customer — fabricating
+      // customer classifications with an empty team set would be a
+      // silent corruption. Return the warning + empty result
+      // immediately and skip the comment-index build (which would
+      // produce only counts, no role signal anyway). This guarantees
+      // zero comment fetches on the no-team path.
       if (!teamOverride && !hasTeam) {
         warning =
           "No team IDs configured — stalled-promise detection requires knowing who your team is. " +
             "Call find_featurebase_user with your name to discover your user ID, then pass the " +
             "returned userIds as teamUserIds. Alternatively set FEATUREBASE_TEAM_USER_IDS env var.";
+        return {
+          minDaysSinceAdminReply: minDays,
+          teamSource,
+          warning,
+          totalCandidates: 0,
+          returned: 0,
+          promises: [],
+        };
       }
 
       // For the user-friendly "stalled" semantic, we need per-post
@@ -1228,11 +1289,7 @@ export function createClient(opts: ClientOptions = {}): Client {
             if (p.commentCount === 0) return { p, eng: undefined };
             try {
               const neutral = await getComments(fetcher, cache, p.id);
-              const classified = reclassifyTree(
-                neutral,
-                teamOverride ?? team,
-                true,
-              );
+              const classified = reclassifyTree(neutral, effectiveTeam, true);
               const eng = teamOverride
                 ? computeEngagementWithTeamOverride(classified, teamOverride)
                 : computeEngagement(classified);
@@ -1291,7 +1348,7 @@ export function createClient(opts: ClientOptions = {}): Client {
           const neutral = await getComments(fetcher, cache, p.id);
           const classified = reclassifyTree(
             neutral,
-            teamOverride ?? team,
+            effectiveTeam,
             true,
           );
           const adminPredicate = teamOverride

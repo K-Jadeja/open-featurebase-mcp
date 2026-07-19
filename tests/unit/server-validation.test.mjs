@@ -226,28 +226,39 @@ console.log("=== Direct validateToolInput: bad args per tool ===\n");
 // payload must produce a clean message that does NOT echo it. This is
 // the unit-level proof that the formatter itself does not leak values,
 // independent of any schema behavior.
+//
+// Important: formatZodIssue reads `issue.options` (not `issue.expected`)
+// for invalid_enum_value. The previous version of this test passed
+// `expected: ["a", "b"]` which the formatter silently ignored, then
+// the assertion "includes 'a'" happened to pass because the path
+// "apiKey" contains an 'a' and the prefix "must be one of" contains a
+// 'b' in 'one'. That was accidental. The fixed version uses
+// `options: ["a", "b"]` and asserts the exact expected output.
 {
   const { formatZodIssue } = await import("../../dist/validation.js");
   const secret = "AKIA-FakeAWSKey-AAAABBBBCCCCDDDD";
   const syntheticIssue = {
     code: "invalid_enum_value",
-    expected: ["a", "b"],
+    options: ["a", "b"],
     received: secret,
     path: ["apiKey"],
-    message: `Invalid enum value. Expected 'a' | 'b', received '${secret}'`,
   };
   const formatted = formatZodIssue(syntheticIssue);
   check(
-    `formatZodIssue produces clean message: "${formatted}"`,
-    formatted.startsWith("apiKey:") &&
-      formatted.includes("a") &&
-      formatted.includes("b") &&
-      !formatted.includes(secret),
+    `formatZodIssue produces exact expected output`,
+    formatted === "apiKey: must be one of a, b",
+    `got: ${formatted}`,
   );
   check(
     "formatZodIssue does NOT echo the offending secret value",
     !formatted.includes(secret),
     `formatted: ${formatted}`,
+  );
+  // Belt-and-braces: the formatter must not see the secret via any
+  // field on the issue object, including the default-fallback path.
+  check(
+    "formatZodIssue never echoes received (no 'received:' substring)",
+    !formatted.includes("received"),
   );
 }
 
