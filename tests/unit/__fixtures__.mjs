@@ -90,6 +90,12 @@ export function buildMockComment({
 export function buildMockFetcher({
   listingPages = [],
   commentPages = {},
+  /**
+   * When true, throw a synthetic error for any comment URL whose
+   * submissionId is not present in commentPages. Use this to exercise
+   * the production partial-fetch failure paths without flakiness.
+   */
+  failOnMissingComments = false,
 } = {}) {
   const calls = [];
   function record(url) { calls.push(url); }
@@ -131,6 +137,9 @@ export function buildMockFetcher({
       const page = Number(new URL(url, BASE_URL).searchParams.get("page") || 1);
       const pages = commentPages[subm] ?? [];
       if (pages.length === 0) {
+        if (failOnMissingComments) {
+          throw new Error(`mock fetcher: no canned comments for ${subm}`);
+        }
         return jsonResponse({
           results: [],
           page,

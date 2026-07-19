@@ -433,6 +433,11 @@ console.log("\n=== Scenario 6: stalled-promises no-team short-circuits ===\n");
     check("callTool returned cleanly", !result.isError);
     const body = parseText(result);
     check(
+      "teamSource === 'none' for no-team response",
+      body.teamSource === "none",
+      `got: ${body.teamSource}`,
+    );
+    check(
       "warning is present",
       typeof body.warning === "string" && body.warning.length > 0,
     );
@@ -442,18 +447,23 @@ console.log("\n=== Scenario 6: stalled-promises no-team short-circuits ===\n");
       `got: ${JSON.stringify(body.promises)}`,
     );
     check(
-      "zero comment fetches happened",
+      "ZERO comment fetches happened (no-team short-circuit before listing)",
       mock.commentCount() === 0,
       `commentCount: ${mock.commentCount()}`,
     );
     check(
+      "ZERO listing fetches happened (no-team short-circuit before getAllPosts)",
+      mock.listingCount() === 0,
+      `listingCount: ${mock.listingCount()}`,
+    );
+    check(
+      "zero total fetches",
+      mock.totalCount() - before === 0,
+      `delta: ${mock.totalCount() - before}`,
+    );
+    check(
       "no fabricated customer classifications in response (no per-post fields)",
       !("promises" in body) || body.promises.length === 0,
-    );
-    // And the listing IS still fetched (we need it to know there ARE posts).
-    check(
-      "listing fetches still happened (we need them for totalResults)",
-      mock.listingCount() > 0,
     );
   } finally {
     await mcp.close();
@@ -462,18 +472,20 @@ console.log("\n=== Scenario 6: stalled-promises no-team short-circuits ===\n");
 }
 
 // ============================================================
-// Scenario 7: stalled-promises with override + env team both set.
-// Override wins; env is irrelevant for this call.
+// Scenario 7: stalled-promises override wins — deep assertions.
+// Env says alice is team, override is bob. Alice's comments become
+// customer; alice's post author also becomes customer. The returned
+// stalled promises[] must reflect the override (alice is no admin).
+// Then flip the override to alice and verify the SAME post returns.
 // ============================================================
-console.log("\n=== Scenario 7: stalled-promises override wins ===\n");
+console.log("\n=== Scenario 7: stalled-promises override wins (deep) ===\n");
 {
   const { mcp, mock, server, client } = await bootServer({
     teamEnv: "alice-id",
   });
   try {
-    // Env says alice is team, but we override to bob. Alice's comment
-    // becomes customer, so no admin reply → no stalled promise for p1.
-    const result = await mcp.callTool({
+    // Override=bob. Alice is NOT in the override → customer.
+    const r1 = await mcp.callTool({
       name: "get_featurebase_stalled_promises",
       arguments: {
         minDaysSinceAdminReply: 0,
@@ -481,17 +493,340 @@ console.log("\n=== Scenario 7: stalled-promises override wins ===\n");
         teamUserIds: ["bob-id"],
       },
     });
-    const body = parseText(result);
+    const b1 = parseText(r1);
     check(
       "override=bob (env=alice): teamSource === 'override'",
-      body.teamSource === "override",
-      `got: ${body.teamSource}`,
+      b1.teamSource === "override",
+      `got: ${b1.teamSource}`,
     );
-    // Alice's only comment is not an admin reply → no stalled candidate.
+    // Alice is now customer → her comments don't count as admin replies,
+    // so p1's "alice replied then bob replied" pattern is no longer a
+    // stalled promise (alice is customer, bob is customer too, no admin).
     check(
-      "no stalled promises (alice is not admin under override)",
-      Array.isArray(body.promises) && body.promises.length === 0,
-      `got: ${JSON.stringify(body.promises)}`,
+      "override=bob: no stalled promises (alice demoted to customer)",
+      Array.isArray(b1.promises) && b1.promises.length === 0,
+      `got: ${JSON.stringify(b1.promises)}`,
+    );
+
+    // Now flip override=alice. Alice is admin again. p1 should be
+    // returned as stalled (alice admin-replied then bob customer-replied).
+    const r2 = await mcp.callTool({
+      name: "get_featurebase_stalled_promises",
+      arguments: {
+        minDaysSinceAdminReply: 0,
+        limit: 10,
+        teamUserIds: ["alice-id"],
+      },
+    });
+    const b2 = parseText(r2);
+    check(
+      "override=alice: teamSource === 'override'",
+      b2.teamSource === "override",
+      `got: ${b2.teamSource}`,
+    );
+    check(
+      "override=alice: one stalled promise (alice is admin, bob is customer)",
+      Array.isArray(b2.promises) && b2.promises.length === 1,
+      `got: ${b2.promises?.length}`,
+    );
+    const promise = b2.promises?.[0];
+    check(
+      "returned promise has slug 'p1'",
+      promise?.slug === "p1",
+      `got: ${promise?.slug}`,
+    );
+    // Post author is "other-id" (NOT in override alice → customer).
+    check(
+      "post.author.userId === 'other-id'",
+      promise?.author?.userId === "other-id",
+      `got: ${promise?.author?.userId}`,
+    );
+    check(
+      "post.author.role === 'customer' (other-id not in override)",
+      promise?.author?.role === "customer",
+      `got: ${promise?.author?.role}`,
+    );
+    // lastAdminMessage was alice's comment.
+    check(
+      "lastAdminMessage.author.userId === 'alice-id'",
+      promise?.lastAdminMessage?.author?.userId === "alice-id",
+      `got: ${promise?.lastAdminMessage?.author?.userId}`,
+    );
+    check(
+      "lastAdminMessage.author.role === 'admin' (alice in override)",
+      promise?.lastAdminMessage?.author?.role === "admin",
+      `got: ${promise?.lastAdminMessage?.author?.role}`,
+    );
+    // lastCustomerMessage was bob's comment.
+    check(
+      "lastCustomerMessage.author.userId === 'bob-id'",
+      promise?.lastCustomerMessage?.author?.userId === "bob-id",
+      `got: ${promise?.lastCustomerMessage?.author?.userId}`,
+    );
+    check(
+      "lastCustomerMessage.author.role === 'customer' (bob not in override)",
+      promise?.lastCustomerMessage?.author?.role === "customer",
+      `got: ${promise?.lastCustomerMessage?.author?.role}`,
+    );
+  } finally {
+    await mcp.close();
+    delete process.env.FEATUREBASE_TEAM_USER_IDS;
+  }
+}
+
+// ============================================================
+// Scenario 8: post author IS also a commenter. The post-author role
+// and the comment-author role must agree under every team resolution.
+// ============================================================
+console.log("\n=== Scenario 8: post author = commenter (agreement) ===\n");
+{
+  // Custom board: post author is Alice. Comment author is also Alice.
+  // Two comments: alice (admin role under env team), then bob.
+  process.env.FEATUREBASE_TEAM_USER_IDS = "alice-id";
+  const board = [
+    buildMockPost({
+      id: "p1", slug: "p1", title: "P1", commentCount: 2,
+      author: { _id: "alice-id", name: "Alice" },
+    }),
+  ];
+  const comments = [[
+    buildMockComment({
+      id: "c1", userId: "alice-id", name: "Alice",
+      createdAt: "2026-05-01T00:00:00Z",
+    }),
+    buildMockComment({
+      id: "c2", userId: "bob-id", name: "Bob",
+      createdAt: "2026-06-15T00:00:00Z",
+    }),
+  ]];
+  const mock = buildMockFetcher({
+    listingPages: [board],
+    commentPages: { p1: comments },
+  });
+  const client = createClient({ fetcher: mock });
+  const server = buildServer({ client });
+  const mcp = new McpClient(
+    { name: "agreement-client", version: "1" },
+    { capabilities: {} },
+  );
+  const [sT, cT] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(sT), mcp.connect(cT)]);
+  try {
+    // Default team (alice is in env team): post.author.role = admin
+    // AND comment by alice has role = admin.
+    const r1 = await mcp.callTool({
+      name: "get_featurebase_post",
+      arguments: { slug: "p1", include_comments: true },
+    });
+    const b1 = parseText(r1);
+    check(
+      "default team: post.author.role === 'admin' (alice is post author)",
+      b1.author?.role === "admin",
+      `got: ${b1.author?.role}`,
+    );
+    check(
+      "default team: alice's comment role === 'admin'",
+      b1.comments?.[0]?.author?.role === "admin",
+      `got: ${b1.comments?.[0]?.author?.role}`,
+    );
+
+    // Override = bob. Alice is no longer in team. Post author AND
+    // comment author for alice must BOTH become customer.
+    const r2 = await mcp.callTool({
+      name: "get_featurebase_post",
+      arguments: {
+        slug: "p1",
+        include_comments: true,
+        teamUserIds: ["bob-id"],
+      },
+    });
+    const b2 = parseText(r2);
+    check(
+      "override=bob: post.author.role === 'customer' (alice demoted)",
+      b2.author?.role === "customer",
+      `got: ${b2.author?.role}`,
+    );
+    check(
+      "override=bob: alice's comment role === 'customer'",
+      b2.comments?.[0]?.author?.role === "customer",
+      `got: ${b2.comments?.[0]?.author?.role}`,
+    );
+
+    // No team at all: BOTH roles must be 'unknown' (no fabricated
+    // classifications).
+    delete process.env.FEATUREBASE_TEAM_USER_IDS;
+    // New server to refresh env snapshot.
+    await mcp.close();
+    const client2 = createClient({ fetcher: mock });
+    const server2 = buildServer({ client: client2 });
+    const mcp2 = new McpClient(
+      { name: "agreement-client-2", version: "1" },
+      { capabilities: {} },
+    );
+    const [sT2, cT2] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server2.connect(sT2), mcp2.connect(cT2)]);
+    const r3 = await mcp2.callTool({
+      name: "get_featurebase_post",
+      arguments: { slug: "p1", include_comments: true },
+    });
+    const b3 = parseText(r3);
+    check(
+      "no team: post.author.role === 'unknown'",
+      b3.author?.role === "unknown",
+      `got: ${b3.author?.role}`,
+    );
+    check(
+      "no team: alice's comment role === 'unknown'",
+      b3.comments?.[0]?.author?.role === "unknown",
+      `got: ${b3.comments?.[0]?.author?.role}`,
+    );
+    await mcp2.close();
+  } finally {
+    delete process.env.FEATUREBASE_TEAM_USER_IDS;
+  }
+}
+
+// ============================================================
+// Scenario 9: stalled-promises partial fetch failure surfaces
+// engagementComplete=false and the failed post slug.
+// One post succeeds, one post's comments fetch fails.
+// ============================================================
+console.log("\n=== Scenario 9: stalled-promises partial-fetch surfaces loudly ===\n");
+{
+  // Two posts: p1 (comments fetchable), p2 (comments throw).
+  process.env.FEATUREBASE_TEAM_USER_IDS = "alice-id";
+  const board = [
+    buildMockPost({
+      id: "p1", slug: "p1", title: "P1", commentCount: 2,
+      author: { _id: "other-id", name: "Other" },
+    }),
+    buildMockPost({
+      id: "p2", slug: "p2", title: "P2", commentCount: 1,
+      author: { _id: "other-id", name: "Other" },
+    }),
+  ];
+  const mock = buildMockFetcher({
+    listingPages: [board],
+    commentPages: {
+      p1: [[
+        buildMockComment({
+          id: "c1", userId: "alice-id", name: "Alice",
+          createdAt: "2026-05-01T00:00:00Z",
+        }),
+        buildMockComment({
+          id: "c2", userId: "bob-id", name: "Bob",
+          createdAt: "2026-06-15T00:00:00Z",
+        }),
+      ]],
+      // p2 intentionally absent + failOnMissingComments: true below
+      // means the fetcher throws for p2 — exercises the partial-fetch
+      // failure path in production code.
+    },
+    failOnMissingComments: true,
+  });
+  const client = createClient({ fetcher: mock });
+  const server = buildServer({ client });
+  const mcp = new McpClient(
+    { name: "partial-stalled-client", version: "1" },
+    { capabilities: {} },
+  );
+  const [sT, cT] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(sT), mcp.connect(cT)]);
+  try {
+    const r = await mcp.callTool({
+      name: "get_featurebase_stalled_promises",
+      arguments: { minDaysSinceAdminReply: 0, limit: 10 },
+    });
+    const body = parseText(r);
+    check(
+      "engagementComplete === false (p2 fetch failed)",
+      body.engagementComplete === false,
+      `got: ${body.engagementComplete}`,
+    );
+    check(
+      "failedPostSlugs includes 'p2'",
+      Array.isArray(body.failedPostSlugs) && body.failedPostSlugs.includes("p2"),
+      `got: ${JSON.stringify(body.failedPostSlugs)}`,
+    );
+    check(
+      "failedCommentPostCount === 1",
+      body.failedCommentPostCount === 1,
+      `got: ${body.failedCommentPostCount}`,
+    );
+    check(
+      "warning mentions comment failure",
+      typeof body.warning === "string" &&
+        body.warning.toLowerCase().includes("comment"),
+    );
+    // The successful stalled promise is still in promises[].
+    const slugs = (body.promises ?? []).map((p) => p.slug);
+    check(
+      "successful stalled promise (p1) is still returned alongside the failure",
+      slugs.includes("p1"),
+      `got: ${slugs.join(",")}`,
+    );
+    check(
+      "p2 is NOT in promises[] (no engagement fields available)",
+      !slugs.includes("p2"),
+      `got: ${slugs.join(",")}`,
+    );
+  } finally {
+    await mcp.close();
+    delete process.env.FEATUREBASE_TEAM_USER_IDS;
+  }
+}
+
+// ============================================================
+// Scenario 10: all comment fetches fail → response still reports
+// incompleteness, not a silent empty result.
+// ============================================================
+console.log("\n=== Scenario 10: all comment fetches fail ===\n");
+{
+  process.env.FEATUREBASE_TEAM_USER_IDS = "alice-id";
+  const board = [
+    buildMockPost({
+      id: "p1", slug: "p1", title: "P1", commentCount: 1,
+      author: { _id: "other-id", name: "Other" },
+    }),
+  ];
+  // Empty commentPages + failOnMissingComments → fetcher throws on
+  // every comment URL.
+  const mock = buildMockFetcher({
+    listingPages: [board],
+    commentPages: {},
+    failOnMissingComments: true,
+  });
+  const client = createClient({ fetcher: mock });
+  const server = buildServer({ client });
+  const mcp = new McpClient(
+    { name: "all-fail-client", version: "1" },
+    { capabilities: {} },
+  );
+  const [sT, cT] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(sT), mcp.connect(cT)]);
+  try {
+    const r = await mcp.callTool({
+      name: "get_featurebase_stalled_promises",
+      arguments: { minDaysSinceAdminReply: 0, limit: 10 },
+    });
+    const body = parseText(r);
+    check(
+      "engagementComplete === false (all fetches failed)",
+      body.engagementComplete === false,
+    );
+    check(
+      "failedPostSlugs includes 'p1'",
+      Array.isArray(body.failedPostSlugs) && body.failedPostSlugs.includes("p1"),
+    );
+    check(
+      "warning is non-empty (caller observes failure)",
+      typeof body.warning === "string" && body.warning.length > 0,
+    );
+    check(
+      "promises[] may be empty but is not the only signal — failedPostSlugs carries the failure",
+      Array.isArray(body.promises) &&
+        body.promises.length === 0 &&
+        (body.failedPostSlugs?.length ?? 0) > 0,
     );
   } finally {
     await mcp.close();

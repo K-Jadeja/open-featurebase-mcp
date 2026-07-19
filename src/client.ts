@@ -397,6 +397,39 @@ function reclassifyTree(
 }
 
 /**
+ * Re-derive a post's `author.role` against a request-specific team set.
+ *
+ * `getAllPosts()` builds the post listing once with the factory-time
+ * default team, which is correct for cache lifetime but stale for any
+ * request that supplies a `teamUserIds` override. Without this helper,
+ * a caller could see `post.author.role === "admin"` while the SAME
+ * user's comment in `comments[].author.role === "customer"` because
+ * the comments were reclassified but the post author wasn't.
+ *
+ * Apply this in any path that returns a post when a per-call team
+ * override (or any non-default effective team) is active. Identity
+ * fields (name, picture, userId) are preserved from the cached post.
+ */
+function reclassifyPostAuthor(
+  post: NormalizedPost,
+  effectiveTeam: ReadonlySet<string>,
+  configured: boolean,
+): NormalizedPost {
+  return {
+    ...post,
+    author: enrichAuthor(
+      {
+        name: post.author.name,
+        picture: post.author.picture,
+        userId: post.author.userId,
+      },
+      effectiveTeam,
+      configured,
+    ),
+  };
+}
+
+/**
  * Resolve the effective team set + configured flag for a single call,
  * given the per-call override (or null) and the factory-time default
  * team set. Used by every engagement path so the override and the
@@ -677,9 +710,12 @@ export interface Client {
   }>;
   getStalledPromises: (args: GetStalledPromisesArgs) => Promise<{
     minDaysSinceAdminReply: number;
-    teamSource: "override" | "default";
+    teamSource: "override" | "default" | "none";
     warning?: string;
     unusedTeamUserIds?: string[];
+    engagementComplete?: boolean;
+    failedCommentPostCount?: number;
+    failedPostSlugs?: string[];
     totalCandidates: number;
     returned: number;
     promises: StalledPromise[];
@@ -995,6 +1031,16 @@ export function createClient(opts: ClientOptions = {}): Client {
           return { ...p, ...result.eng };
         });
 
+        // Re-derive each post's author role against the per-call team
+        // so post.author.role matches the engagement fields under the
+        // SAME effective team. Without this, a cached post author
+        // (classified at factory time with the default team) could
+        // disagree with the just-computed engagement that uses the
+        // override team.
+        posts = posts.map((p) =>
+          reclassifyPostAuthor(p, effectiveTeam, true),
+        );
+
         posts = posts.filter(
           (p) => (p.hasAdminReply ?? null) === args.hasAdminReply,
         );
@@ -1059,8 +1105,24 @@ export function createClient(opts: ClientOptions = {}): Client {
 
       const enriched = await enrichPostEngagement(post, teamUserIds);
 
+      // Re-derive the post author role against the per-call team so
+      // post.author.role matches comments[].author.role for the SAME
+      // user under the SAME effective team. Without this, the cached
+      // post.author.role (computed at factory time with the default
+      // team) would disagree with the freshly-reclassified comment
+      // author role whenever a teamUserIds override is supplied.
+      const {
+        team: effectiveTeamReclass,
+        configured: teamConfigured,
+      } = resolveTeam(teamUserIds, team, hasTeam);
+      const enrichedWithAuthor = reclassifyPostAuthor(
+        enriched,
+        effectiveTeamReclass,
+        teamConfigured,
+      );
+
       if (!includeComments) {
-        return { ...enriched, contentHtml, contentText };
+        return { ...enrichedWithAuthor, contentHtml, contentText };
       }
 
       let comments: NormalizedComment[] | undefined;
@@ -1074,10 +1136,6 @@ export function createClient(opts: ClientOptions = {}): Client {
         // env-var team), pass configured=false so every author is
         // "unknown" rather than fabricated as customer.
         const neutral = await getComments(fetcher, cache, post.id);
-        const {
-          team: effectiveTeamReclass,
-          configured: teamConfigured,
-        } = resolveTeam(teamUserIds, team, hasTeam);
         comments = reclassifyTree(
           neutral,
           effectiveTeamReclass,
@@ -1091,7 +1149,7 @@ export function createClient(opts: ClientOptions = {}): Client {
         );
       }
       return {
-        ...enriched,
+        ...enrichedWithAuthor,
         contentHtml,
         contentText,
         comments,
@@ -1227,9 +1285,6 @@ export function createClient(opts: ClientOptions = {}): Client {
       );
       const limit = Math.max(1, Math.min(args.limit ?? 20, 50));
       const sortBy = args.sortBy ?? "staleness";
-      const all = await getAllPosts();
-      const now = Date.now();
-      const minMs = minDays * 24 * 60 * 60 * 1000;
 
       const wantedTypes = new Set<string>();
       for (const friendly of args.status ?? []) {
@@ -1241,29 +1296,27 @@ export function createClient(opts: ClientOptions = {}): Client {
         args.teamUserIds && args.teamUserIds.length > 0
           ? new Set(args.teamUserIds)
           : null;
-      const teamSource: "override" | "default" = teamOverride
-        ? "override"
-        : "default";
-      const effectiveTeam = teamOverride ?? team;
+      const {
+        team: effectiveTeam,
+        configured: teamConfigured,
+      } = resolveTeam(args.teamUserIds, team, hasTeam);
 
       let warning: string | undefined;
       let unusedTeamUserIds: string[] | undefined;
 
-      // Short-circuit when no team reference is available. Without a
-      // team, we cannot classify admin vs customer — fabricating
-      // customer classifications with an empty team set would be a
-      // silent corruption. Return the warning + empty result
-      // immediately and skip the comment-index build (which would
-      // produce only counts, no role signal anyway). This guarantees
-      // zero comment fetches on the no-team path.
-      if (!teamOverride && !hasTeam) {
+      // Short-circuit when no team reference is available. We do this
+      // BEFORE getAllPosts() so the no-team path makes zero listing and
+      // zero comment requests. Without a team we cannot classify
+      // admin vs customer — fabricating customer classifications with
+      // an empty team set would be silent corruption.
+      if (!teamConfigured) {
         warning =
           "No team IDs configured — stalled-promise detection requires knowing who your team is. " +
             "Call find_featurebase_user with your name to discover your user ID, then pass the " +
             "returned userIds as teamUserIds. Alternatively set FEATUREBASE_TEAM_USER_IDS env var.";
         return {
           minDaysSinceAdminReply: minDays,
-          teamSource,
+          teamSource: "none" as const,
           warning,
           totalCandidates: 0,
           returned: 0,
@@ -1271,39 +1324,77 @@ export function createClient(opts: ClientOptions = {}): Client {
         };
       }
 
+      const teamSource: "override" | "default" = teamOverride
+        ? "override"
+        : "default";
+
+      const all = await getAllPosts();
+      const now = Date.now();
+      const minMs = minDays * 24 * 60 * 60 * 1000;
+
       // For the user-friendly "stalled" semantic, we need per-post
       // adminLastReplyDate/customerLastReplyDate, which means fetching
       // comments. Build the index lazily (cached after first call).
+      // Even if every fetch fails, index.counts.size may be 0 — we must
+      // still run the candidate-enrichment loop so the failed posts
+      // surface in failedPostSlugs and engagementComplete=false.
       const index = await ensureCommentIndex();
 
       let candidates = all.normalized.slice();
 
-      // Annotate each post with engagement under the active team set,
-      // using the cached index when possible.
-      if (teamOverride || index.counts.size > 0) {
-        candidates = await mapWithConcurrency(
-          candidates,
-          COMMENTS_CONCURRENCY,
-          async (p) => {
-            // We need per-post dates, so fetch the post's comments.
-            if (p.commentCount === 0) return { p, eng: undefined };
-            try {
-              const neutral = await getComments(fetcher, cache, p.id);
-              const classified = reclassifyTree(neutral, effectiveTeam, true);
-              const eng = teamOverride
-                ? computeEngagementWithTeamOverride(classified, teamOverride)
-                : computeEngagement(classified);
-              return { p, eng };
-            } catch {
-              return { p, eng: undefined };
-            }
-          },
-        ).then((resolved) =>
-          resolved.map(({ p, eng }) =>
-            eng ? { ...p, ...eng } : { ...p, commentFetchFailed: true },
-          ),
-        );
-      }
+      // Track failures here so we can surface engagementComplete +
+      // failedPostSlugs at the top level, regardless of which posts
+      // make it into promises[].
+      let engagementComplete = true;
+      const failedPostSlugs: string[] = [];
+
+      // Annotate each post with engagement under the active team set.
+      // No conditional gate: if teamConfigured is true (the no-team
+      // branch above already returned), every comment-bearing post
+      // is fetched and classified. Failures must be observable.
+      type CandidateResult =
+        | { p: NormalizedPost; slug: string; ok: true; eng: EngagementFields }
+        | { p: NormalizedPost; slug: string; ok: false };
+      candidates = await mapWithConcurrency(
+        candidates,
+        COMMENTS_CONCURRENCY,
+        async (p): Promise<CandidateResult> => {
+          if (p.commentCount === 0) {
+            return { p, slug: p.slug, ok: true, eng: {} as EngagementFields };
+          }
+          try {
+            const neutral = await getComments(fetcher, cache, p.id);
+            const classified = reclassifyTree(neutral, effectiveTeam, true);
+            const eng = teamOverride
+              ? computeEngagementWithTeamOverride(classified, teamOverride)
+              : computeEngagement(classified);
+            return { p, slug: p.slug, ok: true, eng };
+          } catch (err) {
+            console.error(
+              `[featurebase-mcp] stalled-promises: comments fetch failed for ${p.slug}:`,
+              err,
+            );
+            return { p, slug: p.slug, ok: false };
+          }
+        },
+      ).then((resolved) =>
+        resolved.map((r) => {
+          if (r.ok) {
+            return { ...r.p, ...r.eng };
+          }
+          failedPostSlugs.push(r.slug);
+          engagementComplete = false;
+          return { ...r.p, commentFetchFailed: true };
+        }),
+      );
+
+      // Re-derive each post's author role against the per-call team so
+      // post.author.role matches the engagement fields. Without this,
+      // post.author.role could disagree with lastAdminMessage.role
+      // when a teamUserIds override is supplied.
+      candidates = candidates.map((p) =>
+        reclassifyPostAuthor(p, effectiveTeam, true),
+      );
 
       if (teamOverride) {
         const matchedIds = new Set<string>();
@@ -1445,11 +1536,30 @@ export function createClient(opts: ClientOptions = {}): Client {
         if (unused.length > 0) unusedTeamUserIds = unused;
       }
 
+      let engagementWarning: string | undefined;
+      if (!engagementComplete) {
+        engagementWarning =
+          `Stalled-promise results are incomplete — comment fetch failed for ` +
+          `${failedPostSlugs.length} post(s) (${failedPostSlugs.slice(0, 5).join(", ")}` +
+          (failedPostSlugs.length > 5 ? ", …" : "") +
+          `). Their admin/customer dates are unknown and they may have been ` +
+          `excluded from promises[]. Re-run after a few minutes to retry, or ` +
+          `remove them from the board and call again.`;
+      }
+      // Merge the partial-failure warning with any pre-existing warning
+      // (currently only the no-team branch — but that branch has its own
+      // short-circuit return, so we never reach this point with both).
+      const finalWarning = engagementWarning ?? warning;
+
       return {
         minDaysSinceAdminReply: minDays,
         teamSource,
-        warning,
+        warning: finalWarning,
         unusedTeamUserIds,
+        engagementComplete,
+        failedCommentPostCount: failedPostSlugs.length || undefined,
+        failedPostSlugs:
+          failedPostSlugs.length > 0 ? failedPostSlugs : undefined,
         totalCandidates: stalled.length,
         returned: enriched.length,
         promises: enriched,
