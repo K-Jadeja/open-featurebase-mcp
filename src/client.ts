@@ -1,21 +1,38 @@
 /**
- * FeaturebaseClient
+ * FeaturebaseClient — factory function over the Featurebase public API.
  *
- * Reverse-engineered scraper for public Featurebase boards.
+ * ## Architecture
  *
- * Strategy: the public board is a Next.js SPA. Every page embeds its data
- * inside `<script id="__NEXT_DATA__" type="application/json">...</script>`.
- * We regex the script tag, JSON.parse, and normalize. No DOM scraping, no
- * cheerio — the data is already JSON.
+ * The client is a closure-bound factory. Each `createClient(opts)` call
+ * returns its own client with its own:
+ *   - in-memory listing + comment-index caches (TTL-bound)
+ *   - fetcher implementation (defaults to global `fetch`; tests inject)
  *
- * Requires a desktop User-Agent. Raw `curl` without one gets 404 on
- * `/posts/<slug>` pages (verified).
+ * No module-level state. No global pollution. Two clients can coexist
+ * with different configs in the same process.
  *
- * Public boards only. Auth-gated content is unreachable.
+ * ## Lazy comment enrichment
+ *
+ * Previously every listing call fetched comments for every post with
+ * comments (33 fetches on the current board). That was wasteful — most
+ * listing calls don't consume the per-author comment index. Now:
+ *   - `getAllPosts()` returns the listing + paginated, ~6 fetches total.
+ *   - `ensureCommentIndex()` builds the per-userId totalCommentCount map
+ *     on demand (33 fetches first time, cached after via TTL).
+ *   - `findUser()` calls `ensureCommentIndex()` itself before populating
+ *     each match's `totalCommentCount`.
+ *
+ * Net effect: a cold `list_featurebase_posts` is 6 fetches. A cold
+ * `find_featurebase_user` is 6+33=39 fetches (one-time, cached). On a
+ * typical agent flow (1 listing + 1 find_user) the cost is the same,
+ * but pure listing callers pay only 6.
+ *
+ * ## Public boards only
+ *
+ * Auth-gated endpoints (writes, private posts) are unreachable.
  */
 
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { appendFileSync } from "node:fs";
 import type {
   CommentRole,
   NormalizedAuthor,
@@ -24,9 +41,10 @@ import type {
   NormalizedPostDetail,
 } from "./types.js";
 import { aggregateCommentCounts } from "./aggregation.js";
+import { createFetcher, type Fetcher } from "./fetcher.js";
 
 // ---------------------------------------------------------------------------
-// Config
+// Config — read once per factory invocation, so tests can override.
 // ---------------------------------------------------------------------------
 
 const BASE_URL = (
@@ -39,76 +57,14 @@ const USER_AGENT =
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
-// ---------------------------------------------------------------------------
-// Diagnostic network counter.
-//
-// Counts every outbound HTTP request this client makes. Only logs to
-// stderr when FEATUREBASE_DEBUG_NET=1 — opt-in for cold-cache perf tests
-// and production diagnostics. The counter increments per fetch but does
-// not mutate global state (no globalThis.fetch wrap).
-// ---------------------------------------------------------------------------
-
-let _httpReqCount = 0;
-
-export function getHttpRequestCount(): number {
-  return _httpReqCount;
-}
-
-export function resetHttpRequestCount(): void {
-  _httpReqCount = 0;
-}
-
-async function countedFetch(url: string, init: RequestInit): Promise<Response> {
-  _httpReqCount++;
-  if (process.env.FEATUREBASE_DEBUG_NET === "1") {
-    process.stderr.write(
-      `[net ${Date.now()}] ${init.method ?? "GET"} ${url}\n`,
-    );
-  }
-  // Test hook — opt-in via env var. Tests can force a partial fetch
-  // failure by setting FEATUREBASE_FAIL_URL_SUBSTR to a substring the
-  // target URL contains. Used by tests/partial-fetch.test.mjs.
-  if (
-    process.env.FEATUREBASE_FAIL_URL_SUBSTR &&
-    url.includes(process.env.FEATUREBASE_FAIL_URL_SUBSTR)
-  ) {
-    throw new Error(`test-forced failure: ${url}`);
-  }
-  return fetch(url, init);
-}
-
-/**
- * Write the current HTTP request count to a file. Used by cold-cache
- * perf tests so they can verify outbound HTTP count after a server run
- * without needing to intercept the MCP transport's stderr stream.
- *
- * Env: FEATUREBASE_NET_COUNT_FILE — if set, the count is appended to
- * this file (one line per write). Tests can read after a call completes.
- */
-function emitNetCount(): void {
-  const file = process.env.FEATUREBASE_NET_COUNT_FILE;
-  if (!file) return;
-  try {
-    appendFileSync(file, `${_httpReqCount}\n`);
-  } catch (err) {
-    process.stderr.write(`[net-count-write] ${err}\n`);
-  }
-}
-
 const TTL = {
   listing: 300, // 5 min — covers all metadata reads
   comments: 300, // 5 min — matches listing so engagement views stay consistent
-  org: 3600, // 1 hour — org membership rarely changes
 } as const;
 
 /**
- * Comma-separated Featurebase user IDs considered team/admin for role tagging.
- *
- * Falls back to empty when unset. Note: `/api/v1/organization.admins[]`
- * is the org OWNER, not necessarily the team that comments on the board.
- * Set this env var to the user IDs of your team so the comment author
- * `role` field lights up correctly. IDs are visible in any post's author
- * `.userId` or any comment's author `.userId`.
+ * Comma-separated Featurebase user IDs considered team/admin for role
+ * tagging. Falls back to empty when unset.
  */
 const TEAM_USER_IDS: Set<string> = new Set(
   (process.env.FEATUREBASE_TEAM_USER_IDS ?? "")
@@ -118,7 +74,7 @@ const TEAM_USER_IDS: Set<string> = new Set(
 );
 
 // ---------------------------------------------------------------------------
-// Cache (Map + timestamps; 2 keys total so no class needed)
+// Cache (Map + timestamps; one entry per factory instance)
 // ---------------------------------------------------------------------------
 
 interface CacheEntry {
@@ -126,29 +82,27 @@ interface CacheEntry {
   expires: number;
 }
 
-const cache = new Map<string, CacheEntry>();
-
-function cacheGet<T>(key: string): T | null {
-  const e = cache.get(key);
-  if (!e || Date.now() > e.expires) {
-    cache.delete(key);
-    return null;
-  }
-  return e.data as T;
-}
-
-function cacheSet(key: string, data: unknown, ttlSec: number): void {
-  cache.set(key, { data, expires: Date.now() + ttlSec * 1000 });
+function makeCache() {
+  const cache = new Map<string, CacheEntry>();
+  return {
+    get<T>(key: string): T | null {
+      const e = cache.get(key);
+      if (!e || Date.now() > e.expires) {
+        cache.delete(key);
+        return null;
+      }
+      return e.data as T;
+    },
+    set(key: string, data: unknown, ttlSec: number) {
+      cache.set(key, { data, expires: Date.now() + ttlSec * 1000 });
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
 // HTML → text
 // ---------------------------------------------------------------------------
 
-/**
- * Convert HTML to plain text. Cheap, no parser — strips tags + decodes
- * common entities. Good enough for excerpts and full-body text.
- */
 export function htmlToText(html: string): string {
   return html
     .replace(/<style[\s\S]*?<\/style>/gi, "")
@@ -179,10 +133,7 @@ function normalizeStatus(raw: any): NormalizedPost["status"] {
   };
 }
 
-/**
- * Build the basic author shape (no role yet). Role is assigned separately
- * by `enrichAuthor` once the team-user-id set is available.
- */
+/** Basic author (no role yet). */
 function normalizeAuthorBasic(raw: any): Omit<NormalizedAuthor, "role"> {
   return {
     name: raw?.name ?? "Anonymous",
@@ -191,43 +142,22 @@ function normalizeAuthorBasic(raw: any): Omit<NormalizedAuthor, "role"> {
   };
 }
 
-/**
- * Effective team set for this MCP run. Defaults to ONLY the
- * `FEATUREBASE_TEAM_USER_IDS` env var.
- *
- * We deliberately do NOT include `/api/v1/organization.admins` — that field
- * holds the org OWNER, not the team that comments on the board. Including
- * it would make the team set look "configured" (non-empty) while classifying
- * actual team comments as `role: "customer"`. Use the env var for correct
- * role tagging, or pass `teamUserIds` per-call to engagement-bearing tools
- * after calling `find_featurebase_user`.
- *
- * `configured: false` ⇒ role tagging skipped, engagement fields omitted.
- */
-async function getEffectiveTeamSet(): Promise<{
-  set: ReadonlySet<string>;
-  configured: boolean;
-}> {
-  return { set: TEAM_USER_IDS, configured: TEAM_USER_IDS.size > 0 };
+/** Effective team set. */
+function getTeamSet(): ReadonlySet<string> {
+  return TEAM_USER_IDS;
 }
 
-/**
- * Decide role for an author by user ID.
- * - "admin" if team is configured AND userId is in the set
- * - "customer" if team is configured but userId is not in the set
- * - "unknown" if no team is configured at all (we cannot tell)
- *
- * The "unknown" path is the loud-failure contract: rather than lie with
- * "customer" when we have no basis for classification, we expose the gap.
- */
+/** Decide role for an author. */
 function enrichAuthor(
   base: Omit<NormalizedAuthor, "role">,
-  team: { set: ReadonlySet<string>; configured: boolean },
+  team: ReadonlySet<string>,
+  configured?: boolean,
 ): NormalizedAuthor {
+  const isConfigured = configured ?? team.size > 0;
   let role: CommentRole;
-  if (!team.configured) {
+  if (!isConfigured) {
     role = "unknown";
-  } else if (team.set.has(base.userId)) {
+  } else if (team.has(base.userId)) {
     role = "admin";
   } else {
     role = "customer";
@@ -245,7 +175,7 @@ function normalizeCategory(raw: any): string {
 
 function normalizePost(
   raw: any,
-  team: { set: ReadonlySet<string>; configured: boolean },
+  team: ReadonlySet<string>,
 ): NormalizedPost {
   const fullText = htmlToText(raw.content ?? "");
   const EXCERPT_LIMIT = 800;
@@ -264,15 +194,12 @@ function normalizePost(
     author: enrichAuthor(normalizeAuthorBasic(raw.user), team),
     date: raw.date ?? "",
     category: normalizeCategory(raw.postCategory),
-    // Engagement fields are NOT initialized here — getAllPosts merges them
-    // in only when (a) the team is configured and (b) comments fetch
-    // succeeds. Omission is the loud-failure contract for "no team IDs."
   };
 }
 
 function normalizeComment(
   raw: any,
-  team: { set: ReadonlySet<string>; configured: boolean },
+  team: ReadonlySet<string>,
 ): NormalizedComment {
   return {
     id: raw.id,
@@ -290,45 +217,160 @@ function normalizeComment(
 }
 
 // ---------------------------------------------------------------------------
-// Listing fetch (cached, single source of truth for all 4 tools' metadata)
-//
-// Strategy: hit the internal paginated API at `/api/v1/submission?page=N`
-// directly. The SPA's axios baseURL is `/api` (relative). Endpoint is public
-// — no auth, no CSRF required for read.
-//
-// Response shape per page: { results, page, limit, totalPages, totalResults }
-// - Default page size: 10 (set by Featurebase)
-// - We always request `sortBy=date:desc` to match what the SSR bundles; sort/
-//   filter happen client-side so cache stays valid across all sort orders.
-// - We use Promise.allSettled so a partial failure doesn't kill the whole
-//   request — degraded responses still surface via `truncated: true`.
+// Per-post engagement computation
 // ---------------------------------------------------------------------------
 
-interface ListingPayload {
-  raw: any[];
-  normalized: NormalizedPost[];
-  totalResults: number;
-  availableResults: number;
-  /**
-   * userId → total number of comments authored across all threads on the
-   * board. Computed once during the engagement enrichment loop so
-   * find_featurebase_user can return board-wide `totalCommentCount`
-   * without an extra pass.
-   *
-   * IMPORTANT: only counts comments from posts whose fetch succeeded.
-   * Check `commentsComplete` to know whether this is a true board-wide
-   * count or a partial count from a subset of posts.
-   */
-  commentCountByUserId: Map<string, number>;
-  /**
-   * `true` when every post-comment fetch in this listing's enrichment
-   * pass succeeded (or there were no posts with comments to fetch).
-   * `false` if any individual fetch failed — in that case
-   * `commentCountByUserId` is partial. Surfaced via
-   * find_featurebase_user's `commentsComplete` field.
-   */
-  commentsComplete: boolean;
+interface EngagementFields {
+  hasAdminReply: boolean;
+  adminReplyCount: number;
+  customerCommentCount: number;
+  lastCommentDate?: string;
+  adminLastReplyDate?: string;
+  customerLastReplyDate?: string;
 }
+
+function computeEngagement(comments: NormalizedComment[]): EngagementFields {
+  let hasAdminReply = false;
+  let adminReplyCount = 0;
+  let customerCommentCount = 0;
+  let lastCommentDate: string | undefined;
+  let adminLastReplyDate: string | undefined;
+  let customerLastReplyDate: string | undefined;
+
+  function walk(comment: NormalizedComment): void {
+    const isAdmin = comment.author.role === "admin";
+    if (!lastCommentDate || comment.createdAt > lastCommentDate) {
+      lastCommentDate = comment.createdAt;
+    }
+    if (isAdmin) {
+      hasAdminReply = true;
+      adminReplyCount++;
+      if (!adminLastReplyDate || comment.createdAt > adminLastReplyDate) {
+        adminLastReplyDate = comment.createdAt;
+      }
+    } else {
+      customerCommentCount++;
+      if (
+        !customerLastReplyDate ||
+        comment.createdAt > customerLastReplyDate
+      ) {
+        customerLastReplyDate = comment.createdAt;
+      }
+    }
+    for (const reply of comment.replies) walk(reply);
+  }
+
+  for (const c of comments) walk(c);
+  return {
+    hasAdminReply,
+    adminReplyCount,
+    customerCommentCount,
+    lastCommentDate,
+    adminLastReplyDate,
+    customerLastReplyDate,
+  };
+}
+
+function computeEngagementWithTeamOverride(
+  comments: NormalizedComment[],
+  teamSet: ReadonlySet<string>,
+): EngagementFields {
+  let hasAdminReply = false;
+  let adminReplyCount = 0;
+  let customerCommentCount = 0;
+  let lastCommentDate: string | undefined;
+  let adminLastReplyDate: string | undefined;
+  let customerLastReplyDate: string | undefined;
+
+  function walk(comment: NormalizedComment): void {
+    const isAdmin = teamSet.has(comment.author.userId);
+    if (!lastCommentDate || comment.createdAt > lastCommentDate) {
+      lastCommentDate = comment.createdAt;
+    }
+    if (isAdmin) {
+      hasAdminReply = true;
+      adminReplyCount++;
+      if (!adminLastReplyDate || comment.createdAt > adminLastReplyDate) {
+        adminLastReplyDate = comment.createdAt;
+      }
+    } else {
+      customerCommentCount++;
+      if (
+        !customerLastReplyDate ||
+        comment.createdAt > customerLastReplyDate
+      ) {
+        customerLastReplyDate = comment.createdAt;
+      }
+    }
+    for (const reply of comment.replies) walk(reply);
+  }
+
+  for (const c of comments) walk(c);
+  return {
+    hasAdminReply,
+    adminReplyCount,
+    customerCommentCount,
+    lastCommentDate,
+    adminLastReplyDate,
+    customerLastReplyDate,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Find last comment by predicate (for team override paths)
+// ---------------------------------------------------------------------------
+
+function findLastCommentWhere(
+  comments: NormalizedComment[],
+  predicate: (c: NormalizedComment) => boolean,
+): NormalizedComment | null {
+  let last: NormalizedComment | null = null;
+  function walk(c: NormalizedComment): void {
+    if (predicate(c)) {
+      if (!last || c.createdAt > last.createdAt) last = c;
+    }
+    for (const r of c.replies) walk(r);
+  }
+  for (const c of comments) walk(c);
+  return last;
+}
+
+function findLastCommentByRole(
+  comments: NormalizedComment[],
+  role: CommentRole,
+): NormalizedComment | null {
+  return findLastCommentWhere(comments, (c) => c.author.role === role);
+}
+
+function walkComments(
+  comments: NormalizedComment[],
+  fn: (c: NormalizedComment) => void,
+): void {
+  for (const c of comments) {
+    fn(c);
+    walkComments(c.replies, fn);
+  }
+}
+
+function reclassifyTree(
+  comments: NormalizedComment[],
+  team: ReadonlySet<string>,
+  configured: boolean,
+): NormalizedComment[] {
+  return comments.map((c) => ({
+    ...c,
+    author: enrichAuthor(
+      { name: c.author.name, picture: c.author.picture, userId: c.author.userId },
+      team,
+      configured,
+    ),
+    replies: reclassifyTree(c.replies, team, configured),
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Listing API (paginated)
+// ---------------------------------------------------------------------------
 
 interface ApiPage {
   results: any[];
@@ -338,12 +380,12 @@ interface ApiPage {
   totalResults: number;
 }
 
-async function fetchApiPage(page: number): Promise<ApiPage> {
+async function fetchApiPage(fetcher: Fetcher, page: number): Promise<ApiPage> {
   const url = `${BASE_URL}/api/v1/submission?sortBy=date:desc&inReview=false&includePinned=true&page=${page}`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const res = await countedFetch(url, {
+    const res = await fetcher.fetch(url, {
       headers: {
         "User-Agent": USER_AGENT,
         Accept: "application/json, text/plain, */*",
@@ -371,202 +413,9 @@ async function fetchApiPage(page: number): Promise<ApiPage> {
   }
 }
 
-async function getAllPosts(): Promise<ListingPayload> {
-  const cacheKey = "list:all";
-  const cached = cacheGet<ListingPayload>(cacheKey);
-  if (cached) return cached;
-
-  // Fetch page 1 + org admin set in parallel. Both are needed to build the
-  // listing payload: page 1 discovers totalPages, the org set combines
-  // with FEATUREBASE_TEAM_USER_IDS to form the team set for role tagging.
-  const [first, team] = await Promise.all([
-    fetchApiPage(1),
-    getEffectiveTeamSet(),
-  ]);
-  const totalPages = first.totalPages;
-  const totalResults = first.totalResults;
-
-  // Fetch remaining pages in parallel. allSettled so a failure on one page
-  // doesn't take down the whole listing.
-  const rest = await Promise.allSettled(
-    Array.from({ length: Math.max(0, totalPages - 1) }, (_, i) =>
-      fetchApiPage(i + 2),
-    ),
-  );
-  const successfulPages: ApiPage[] = [first];
-  for (const r of rest) {
-    if (r.status === "fulfilled") successfulPages.push(r.value);
-  }
-
-  const raw = successfulPages.flatMap((p) => p.results);
-  const normalized = raw.map((r) => normalizePost(r, team));
-
-  // Engagement enrichment ONLY when (a) team is configured and (b) the
-  // post has comments. Per-post failures set commentFetchFailed rather
-  // than failing the whole listing. When team is not configured we
-  // deliberately skip this so the response loudly omits engagement fields
-  // instead of computing them against an empty team (which would mark
-  // every comment as "customer" — silent corruption).
-  // Always fetch comments for posts that have any — needed for both the
-  // board-wide per-user comment count (used by find_featurebase_user)
-  // AND the engagement-enrichment pass. Engagement CLASSIFICATION only
-  // happens when team is configured, but comment COUNTING happens always.
-  //
-  // Bug fix (audit): a previous version conflated "engagement is null"
-  // (because team is unset → we skipped classification) with "fetch
-  // failed". That made every post show `commentFetchFailed: true` when
-  // no team was configured, even though comments loaded fine. We now
-  // track fetch status separately so commentFetchFailed is only set on
-  // actual fetch errors.
-  const commentCountByUserId = new Map<string, number>();
-  const engagementByPostId = new Map<string, EngagementFields>();
-  const fetchFailedPostIds = new Set<string>();
-  const rawWithComments = raw.filter((r) => (r.commentCount ?? 0) > 0);
-  if (rawWithComments.length > 0) {
-    const fetched = await mapWithConcurrency(
-      rawWithComments,
-      COMMENTS_CONCURRENCY,
-      async (r) => {
-        try {
-          const comments = await getComments(r.id);
-          return { id: r.id, status: "ok" as const, comments };
-        } catch (err) {
-          console.error(
-            `[featurebase-mcp] comments fetch failed for ${r.slug}:`,
-            err,
-          );
-          return { id: r.id, status: "fetch_failed" as const, comments: [] as NormalizedComment[] };
-        }
-      },
-    );
-    for (const { id, status, comments } of fetched) {
-      // Build board-wide per-author comment count. Comments are
-      // empty array on fetch failure, so this naturally skips failed posts.
-      const counts = aggregateCommentCounts(comments);
-      for (const [userId, count] of counts) {
-        commentCountByUserId.set(
-          userId,
-          (commentCountByUserId.get(userId) ?? 0) + count,
-        );
-      }
-      if (status === "fetch_failed") {
-        fetchFailedPostIds.add(id);
-        continue;
-      }
-      // Engagement is only computed when team is configured. When the
-      // team is unset, the post keeps no engagement fields (loud failure).
-      if (team.configured) {
-        engagementByPostId.set(id, computeEngagement(comments));
-      }
-    }
-    for (const post of normalized) {
-      if (engagementByPostId.has(post.id)) {
-        Object.assign(post, engagementByPostId.get(post.id));
-      } else if (fetchFailedPostIds.has(post.id)) {
-        post.commentFetchFailed = true;
-      }
-    }
-  }
-
-  // commentsComplete: true iff every post-comment fetch succeeded. When
-  // there are no posts with comments at all, this is trivially true
-  // (nothing to fetch). When at least one fetch failed, false — the
-  // commentCountByUserId map is a partial count in that case.
-  const commentsComplete = fetchFailedPostIds.size === 0;
-
-  const out: ListingPayload = {
-    raw,
-    normalized,
-    totalResults,
-    availableResults: raw.length,
-    commentCountByUserId,
-    commentsComplete,
-  };
-  cacheSet(cacheKey, out, TTL.listing);
-  emitNetCount();
-  return out;
-}
-
 // ---------------------------------------------------------------------------
-// Organization + comments fetchers
-//
-// The Featurebase SPA exposes the JSON endpoints the client components call:
-//
-//   GET /api/v1/organization
-//     → { admins: string[], owner: string, members: [...], ... }
-//     admins[] holds user IDs of org admins (typically the org OWNER only).
-//     Cached 1h; membership rarely changes.
-//
-//   GET /api/v1/comment?submissionId=<id>
-//     → { results: [Comment], page, limit, totalPages, totalResults }
-//     Top-level comments only; nested replies live on each comment's
-//     `replies` array. Threading is preserved server-side, so we don't have
-//     to rebuild the tree from a flat list.
-//
-//   Submission IDs are NOT the same as slugs. The slug is the URL path
-//   segment (`/posts/<slug>`); the submission ID is the DB `_id` (or `id`
-//   in listing payloads — they're equal here). To fetch comments for a
-//   post by slug, look up the slug in the listing payload first.
+// Comments API (paginated, replies nested server-side)
 // ---------------------------------------------------------------------------
-
-interface OrgPayload {
-  admins: string[];
-  owner: string | null;
-}
-
-async function fetchOrg(): Promise<OrgPayload> {
-  const url = `${BASE_URL}/api/v1/organization`;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const res = await countedFetch(url, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        Accept: "application/json, text/plain, */*",
-        Referer: `${BASE_URL}/`,
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
-    if (!res.ok) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `HTTP ${res.status} fetching ${url}`,
-      );
-    }
-    const data = (await res.json()) as any;
-    return {
-      admins: Array.isArray(data?.admins) ? data.admins : [],
-      owner: typeof data?.owner === "string" ? data.owner : null,
-    };
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function getOrgAdminIds(): Promise<Set<string>> {
-  const cacheKey = "org:admins";
-  const cached = cacheGet<Set<string>>(cacheKey);
-  if (cached) return cached;
-  try {
-    const org = await fetchOrg();
-    const set = new Set<string>(org.admins);
-    cacheSet(cacheKey, set, TTL.org);
-    return set;
-  } catch (err) {
-    // Don't break the whole listing because the org endpoint hiccupped.
-    // Role tagging will degrade to "customer" for everyone.
-    console.error(
-      "[featurebase-mcp] failed to fetch /api/v1/organization; " +
-        "falling back to empty admin set. Set FEATUREBASE_TEAM_USER_IDS " +
-        "to override. Error:",
-      err,
-    );
-    const empty: Set<string> = new Set();
-    cacheSet(cacheKey, empty, TTL.org);
-    return empty;
-  }
-}
 
 interface CommentsApiResponse {
   results: any[];
@@ -577,6 +426,7 @@ interface CommentsApiResponse {
 }
 
 async function fetchCommentsPage(
+  fetcher: Fetcher,
   submissionId: string,
   page: number,
 ): Promise<CommentsApiResponse> {
@@ -586,7 +436,7 @@ async function fetchCommentsPage(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const res = await countedFetch(url, {
+    const res = await fetcher.fetch(url, {
       headers: {
         "User-Agent": USER_AGENT,
         Accept: "application/json, text/plain, */*",
@@ -614,24 +464,22 @@ async function fetchCommentsPage(
   }
 }
 
-/**
- * Fetch all pages of the comment thread for a submission, normalized to a
- * tree (top-level comments + nested replies). Returns [] if the post has no
- * comments.
- */
-async function getComments(submissionId: string): Promise<NormalizedComment[]> {
+async function getComments(
+  fetcher: Fetcher,
+  cache: ReturnType<typeof makeCache>,
+  submissionId: string,
+): Promise<NormalizedComment[]> {
   if (!submissionId) return [];
   const cacheKey = `comments:${submissionId}`;
-  const cached = cacheGet<NormalizedComment[]>(cacheKey);
+  const cached = cache.get<NormalizedComment[]>(cacheKey);
   if (cached) return cached;
 
-  const team = await getEffectiveTeamSet();
-
-  const first = await fetchCommentsPage(submissionId, 1);
+  const team = getTeamSet();
+  const first = await fetchCommentsPage(fetcher, submissionId, 1);
   const totalPages = first.totalPages;
   const rest = await Promise.allSettled(
     Array.from({ length: Math.max(0, totalPages - 1) }, (_, i) =>
-      fetchCommentsPage(submissionId, i + 2),
+      fetchCommentsPage(fetcher, submissionId, i + 2),
     ),
   );
   const allRaw = [
@@ -641,14 +489,7 @@ async function getComments(submissionId: string): Promise<NormalizedComment[]> {
       .flatMap((r) => r.value.results),
   ];
 
-  // The server nests replies inside each top-level comment's `replies`
-  // array; the flat `results` array contains only top-level comments when
-  // pagination > 1. We pass the team set into the recursive normalizer so
-  // every nested reply's author gets a role tag (or "unknown" when no
-  // team is configured).
   const tree = allRaw.map((r) => normalizeComment(r, team));
-
-  // Sort replies within each node by createdAt asc, and roots too.
   function sortReplies(node: NormalizedComment): void {
     node.replies.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     for (const r of node.replies) sortReplies(r);
@@ -656,71 +497,14 @@ async function getComments(submissionId: string): Promise<NormalizedComment[]> {
   for (const root of tree) sortReplies(root);
   tree.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
-  cacheSet(cacheKey, tree, TTL.comments);
+  cache.set(cacheKey, tree, TTL.comments);
   return tree;
 }
 
 // ---------------------------------------------------------------------------
-// Engagement enrichment
-//
-// For each post with commentCount > 0, walk its comment thread once and
-// produce engagement metadata. Used to surface "team has replied", "last
-// admin reply is older than last customer comment", etc., on the listing
-// without forcing agents to fetch each post in detail.
+// Concurrency helper
 // ---------------------------------------------------------------------------
 
-interface EngagementFields {
-  hasAdminReply: boolean;
-  adminReplyCount: number;
-  customerCommentCount: number;
-  lastCommentDate?: string;
-  adminLastReplyDate?: string;
-  customerLastReplyDate?: string;
-}
-
-function computeEngagement(comments: NormalizedComment[]): EngagementFields {
-  let hasAdminReply = false;
-  let adminReplyCount = 0;
-  let customerCommentCount = 0;
-  let lastCommentDate: string | undefined;
-  let adminLastReplyDate: string | undefined;
-  let customerLastReplyDate: string | undefined;
-
-  function walk(comment: NormalizedComment): void {
-    if (!lastCommentDate || comment.createdAt > lastCommentDate) {
-      lastCommentDate = comment.createdAt;
-    }
-    if (comment.author.role === "admin") {
-      hasAdminReply = true;
-      adminReplyCount++;
-      if (!adminLastReplyDate || comment.createdAt > adminLastReplyDate) {
-        adminLastReplyDate = comment.createdAt;
-      }
-    } else {
-      customerCommentCount++;
-      if (!customerLastReplyDate || comment.createdAt > customerLastReplyDate) {
-        customerLastReplyDate = comment.createdAt;
-      }
-    }
-    for (const reply of comment.replies) walk(reply);
-  }
-
-  for (const c of comments) walk(c);
-  return {
-    hasAdminReply,
-    adminReplyCount,
-    customerCommentCount,
-    lastCommentDate,
-    adminLastReplyDate,
-    customerLastReplyDate,
-  };
-}
-
-/**
- * Promise.all with a concurrency cap. `fn` is invoked sequentially within
- * each worker; workers run in parallel. Used to fetch comment threads for
- * every post that has any comments without hammering the API.
- */
 async function mapWithConcurrency<T, R>(
   items: readonly T[],
   limit: number,
@@ -740,139 +524,95 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-/** Max parallel comment fetches during listing enrichment. */
 const COMMENTS_CONCURRENCY = 8;
 
-/**
- * Walk a comment tree and return the chronologically last comment by an
- * author with the given role. Returns null if no comment matches.
- */
-function findLastCommentByRole(
-  comments: NormalizedComment[],
-  role: CommentRole,
-): NormalizedComment | null {
-  let last: NormalizedComment | null = null;
-  function walk(c: NormalizedComment): void {
-    if (c.author.role === role) {
-      if (!last || c.createdAt > last.createdAt) last = c;
-    }
-    for (const r of c.replies) walk(r);
-  }
-  for (const c of comments) walk(c);
-  return last;
-}
+// ---------------------------------------------------------------------------
+// ListingPayload — what getAllPosts returns. NO comment-fetch dependency.
+// ---------------------------------------------------------------------------
 
-/**
- * Walk a comment tree and return the chronologically last comment for
- * which `predicate` returns true. Used when the team set is overridden at
- * call time — we can't use `author.role` (it's stale relative to the
- * override), so we ask the caller to provide the membership test.
- */
-function findLastCommentWhere(
-  comments: NormalizedComment[],
-  predicate: (c: NormalizedComment) => boolean,
-): NormalizedComment | null {
-  let last: NormalizedComment | null = null;
-  function walk(c: NormalizedComment): void {
-    if (predicate(c)) {
-      if (!last || c.createdAt > last.createdAt) last = c;
-    }
-    for (const r of c.replies) walk(r);
-  }
-  for (const c of comments) walk(c);
-  return last;
-}
-
-/**
- * Apply a per-call team-user-id override to a comment tree. The cached
- * `author.role` was computed using the server's default team set (env var
- * + /api/v1/organization admins); when the caller passes a runtime
- * override we re-classify each comment's author on the fly. Used by
- * getStalledPromises so a single call can re-tag engagement.
- *
- * When `trackMatchedIds` is provided, every userId that the override set
- * matched against is recorded — used to surface unusedTeamUserIds.
- */
-function computeEngagementWithTeamOverride(
-  comments: NormalizedComment[],
-  teamSet: ReadonlySet<string>,
-  trackMatchedIds?: Set<string>,
-): EngagementFields {
-  let hasAdminReply = false;
-  let adminReplyCount = 0;
-  let customerCommentCount = 0;
-  let lastCommentDate: string | undefined;
-  let adminLastReplyDate: string | undefined;
-  let customerLastReplyDate: string | undefined;
-
-  function walk(comment: NormalizedComment): void {
-    const isAdmin = teamSet.has(comment.author.userId);
-    if (isAdmin && trackMatchedIds) trackMatchedIds.add(comment.author.userId);
-    if (!lastCommentDate || comment.createdAt > lastCommentDate) {
-      lastCommentDate = comment.createdAt;
-    }
-    if (isAdmin) {
-      hasAdminReply = true;
-      adminReplyCount++;
-      if (!adminLastReplyDate || comment.createdAt > adminLastReplyDate) {
-        adminLastReplyDate = comment.createdAt;
-      }
-    } else {
-      customerCommentCount++;
-      if (!customerLastReplyDate || comment.createdAt > customerLastReplyDate) {
-        customerLastReplyDate = comment.createdAt;
-      }
-    }
-    for (const reply of comment.replies) walk(reply);
-  }
-
-  for (const c of comments) walk(c);
-  return {
-    hasAdminReply,
-    adminReplyCount,
-    customerCommentCount,
-    lastCommentDate,
-    adminLastReplyDate,
-    customerLastReplyDate,
-  };
-}
-
-/**
- * Visit every comment in a tree (top-level + nested replies). Used by
- * find_featurebase_user to scan authors across all threads.
- */
-function walkComments(
-  comments: NormalizedComment[],
-  fn: (c: NormalizedComment) => void,
-): void {
-  for (const c of comments) {
-    fn(c);
-    walkComments(c.replies, fn);
-  }
-}
-
-/**
- * Return a new comment tree with each author's role re-classified using
- * the provided team set. Used by get_featurebase_post when teamUserIds
- * is passed at call time to override the default team.
- */
-function reclassifyTree(
-  comments: NormalizedComment[],
-  team: { set: ReadonlySet<string>; configured: boolean },
-): NormalizedComment[] {
-  return comments.map((c) => ({
-    ...c,
-    author: enrichAuthor(
-      { name: c.author.name, picture: c.author.picture, userId: c.author.userId },
-      team,
-    ),
-    replies: reclassifyTree(c.replies, team),
-  }));
+export interface ListingPayload {
+  raw: any[];
+  normalized: NormalizedPost[];
+  totalResults: number;
+  availableResults: number;
 }
 
 // ---------------------------------------------------------------------------
-// Public client surface
+// Client factory
 // ---------------------------------------------------------------------------
+
+export interface ClientOptions {
+  fetcher?: Fetcher;
+}
+
+export interface Client {
+  listPosts: (args: ListPostsArgs) => Promise<{
+    totalResults: number;
+    availableResults: number;
+    truncated: boolean;
+    returned: number;
+    posts: NormalizedPost[];
+  }>;
+  getPost: (
+    slug: string,
+    includeComments: boolean,
+    teamUserIds?: string[],
+  ) => Promise<NormalizedPostDetail>;
+  getPosts: (args: GetPostsArgs) => Promise<{
+    requested: number;
+    found: number;
+    notFound?: string[];
+    posts: Array<NormalizedPost | NormalizedPostDetail>;
+  }>;
+  searchPosts: (args: SearchPostsArgs) => Promise<{
+    query: string;
+    totalMatches: number;
+    returned: number;
+    posts: NormalizedPost[];
+  }>;
+  getStats: (args: {
+    topVotedLimit?: number;
+    recentLimit?: number;
+  }) => Promise<{
+    totalResults: number;
+    snapshotSize: number;
+    truncated: boolean;
+    snapshotWindow: {
+      from: string;
+      to: string;
+      ordering: "date desc";
+    } | null;
+    topVotedLimit: number;
+    recentLimit: number;
+    statusCountsInSnapshot: Record<string, number>;
+    categoryCountsInSnapshot: Record<string, number>;
+    topVoted: Array<{ slug: string; title: string; upvotes: number }>;
+    recent: Array<{ slug: string; title: string; date: string }>;
+  }>;
+  getStalledPromises: (args: GetStalledPromisesArgs) => Promise<{
+    minDaysSinceAdminReply: number;
+    teamSource: "override" | "default";
+    warning?: string;
+    unusedTeamUserIds?: string[];
+    totalCandidates: number;
+    returned: number;
+    promises: StalledPromise[];
+  }>;
+  findUser: (args: FindUserArgs) => Promise<{
+    query: string;
+    samplePostsScanned: number;
+    commentsComplete: boolean;
+    warning?: string;
+    matches: Array<{
+      userId: string;
+      name: string;
+      postCount: number;
+      commentCountInSampledPosts: number;
+      totalCommentCount: number;
+      guessedRole: CommentRole;
+    }>;
+  }>;
+}
 
 export interface ListPostsArgs {
   status: "all" | "open" | "in_review" | "planned" | "in_progress" | "completed";
@@ -888,422 +628,498 @@ export interface SearchPostsArgs {
 
 export interface GetPostsArgs {
   slugs: string[];
-  include_content?: boolean;
+  include_content: boolean;
 }
 
-// Featurebase postStatus.type values mapped from user-friendly enum names.
-// Verified against all 56 posts on 2026-07-16:
-//   "In Review"   → "reviewing"
-//   "Planned"     → "unstarted"
-//   "In Progress" → "active"
-//   "Completed"   → "completed"
-// "Open" exists in some boards as the default state for newly-created posts;
-// we map it to "open" defensively even though this board has no such posts.
-const STATUS_TYPE_MAP: Record<
-  Exclude<ListPostsArgs["status"], "all">,
-  string
-> = {
-  open: "open",
-  in_review: "reviewing",
-  planned: "unstarted",
-  in_progress: "active",
-  completed: "completed",
-};
-
-function sortPosts(
-  posts: NormalizedPost[],
-  sortBy: ListPostsArgs["sortBy"],
-): NormalizedPost[] {
-  const sorted = [...posts];
-  switch (sortBy) {
-    case "date:desc":
-      sorted.sort((a, b) => b.date.localeCompare(a.date));
-      break;
-    case "date:asc":
-      sorted.sort((a, b) => a.date.localeCompare(b.date));
-      break;
-    case "upvotes:desc":
-      sorted.sort((a, b) => b.upvotes - a.upvotes);
-      break;
-  }
-  return sorted;
+export interface GetStalledPromisesArgs {
+  minDaysSinceAdminReply?: number;
+  limit?: number;
+  teamUserIds?: string[];
+  status?: Array<
+    "open" | "in_review" | "planned" | "in_progress" | "completed"
+  >;
+  sortBy?: "staleness" | "freshness" | "upvotes";
 }
 
-export const client = {
-  async listPosts(args: ListPostsArgs) {
-    const all = await getAllPosts();
-    let posts = all.normalized;
+export interface FindUserArgs {
+  name: string;
+  sampleSize?: number;
+}
 
-    if (args.status !== "all") {
-      const want = STATUS_TYPE_MAP[args.status];
-      posts = posts.filter((p) => p.status.type === want);
-    }
+interface StalledPromise {
+  slug: string;
+  title: string;
+  url: string;
+  status: NormalizedPost["status"];
+  commentCount: number;
+  upvotes: number;
+  author: NormalizedAuthor;
+  date: string;
+  adminLastReplyDate: string;
+  customerLastReplyDate: string;
+  daysSinceAdminReply: number;
+  lastAdminMessage: {
+    author: { name: string; userId: string; role: CommentRole };
+    date: string;
+    excerpt: string;
+  } | null;
+  lastCustomerMessage: {
+    author: { name: string; userId: string; role: CommentRole };
+    date: string;
+    excerpt: string;
+  } | null;
+}
 
-    if (args.hasAdminReply !== undefined) {
-      // hasAdminReply is only present when (team configured + comments
-      // fetched); absent otherwise. The filter compares against the literal
-      // boolean — a post with hasAdminReply undefined never matches when
-      // args.hasAdminReply is true, which is the loud-failure contract
-      // (filtering on data we don't have should return nothing).
-      posts = posts.filter(
-        (p) => (p.hasAdminReply ?? null) === args.hasAdminReply,
-      );
-    }
+// ---------------------------------------------------------------------------
+// Public factory
+// ---------------------------------------------------------------------------
 
-    posts = sortPosts(posts, args.sortBy).slice(0, args.limit);
-
-    return {
-      totalResults: all.totalResults,
-      /** Posts available in this snapshot (≤ totalResults due to SSR bundling). */
-      availableResults: all.availableResults,
-      /** Whether the SSR snapshot is missing some posts from the full board. */
-      truncated: all.availableResults < all.totalResults,
-      returned: posts.length,
-      posts,
-    };
-  },
-
-  async getPost(
-    slug: string,
-    includeComments: boolean,
-    teamUserIds?: string[],
-  ): Promise<NormalizedPostDetail> {
-    const all = await getAllPosts();
-    const post = all.normalized.find((p) => p.slug === slug);
-    if (!post) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        `Post not found: "${slug}". Use list_featurebase_posts to discover valid slugs.`,
-      );
-    }
-    const raw = all.raw.find((p) => p.slug === slug)!;
-    const contentHtml = raw.content ?? "";
-    const contentText = htmlToText(contentHtml);
-
-    const teamOverride =
-      teamUserIds && teamUserIds.length > 0
-        ? { set: new Set(teamUserIds), configured: true }
-        : null;
-
-    // Re-classify engagement fields on the post under the override team, if
-    // the post has comments and comments are available (cached after first
-    // listing miss). Always best-effort — if comments are missing or fetch
-    // fails, fall back to the listing's pre-computed engagement.
-    let postWithOverride: NormalizedPost = post;
-    if (
-      teamOverride &&
-      post.commentCount > 0 &&
-      !post.commentFetchFailed
-    ) {
-      try {
-        const comments = await getComments(post.id);
-        const eng = computeEngagementWithTeamOverride(
-          comments,
-          teamOverride.set,
-        );
-        postWithOverride = { ...post, ...eng };
-      } catch (err) {
-        console.error(
-          `[featurebase-mcp] getPost: engagement re-classify failed for ${slug}:`,
-          err,
-        );
-      }
-    }
-
-    if (!includeComments) {
-      return { ...postWithOverride, contentHtml, contentText };
-    }
-
-    let comments: NormalizedComment[] | undefined;
-    let commentsError: string | undefined;
-    try {
-      const rawComments = await getComments(post.id);
-      comments = teamOverride
-        ? reclassifyTree(rawComments, teamOverride)
-        : rawComments;
-    } catch (err) {
-      // Don't fail the post fetch because comments broke. Surface the error
-      // so the agent can decide what to do, but keep the post intact.
-      commentsError = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[featurebase-mcp] comments fetch failed for ${slug}:`,
-        err,
-      );
-    }
-    return {
-      ...postWithOverride,
-      contentHtml,
-      contentText,
-      comments,
-      commentsError,
-    };
-  },
-
-  async searchPosts(args: SearchPostsArgs) {
-    const all = await getAllPosts();
-    const q = args.query.toLowerCase();
-    const tokens = q.split(/\s+/).filter(Boolean);
-
-    type Hit = { post: NormalizedPost; score: number };
-    const hits: Hit[] = [];
-
-    for (let i = 0; i < all.normalized.length; i++) {
-      const post = all.normalized[i];
-      const raw = all.raw[i];
-      const titleLower = post.title.toLowerCase();
-      const bodyText = htmlToText(raw.content ?? "").toLowerCase();
-
-      let score = 0;
-      // Title hit (full query)
-      if (titleLower.includes(q)) score += 3;
-      // Body hit (full query)
-      if (bodyText.includes(q)) score += 1;
-      // Per-token scoring (any token hit contributes)
-      for (const t of tokens) {
-        if (t === q) continue; // already counted
-        if (titleLower.includes(t)) score += 2;
-        if (bodyText.includes(t)) score += 1;
-      }
-
-      if (score > 0) hits.push({ post, score });
-    }
-
-    hits.sort((a, b) => b.score - a.score);
-    const sliced = hits.slice(0, args.limit).map((h) => h.post);
-
-    return {
-      query: args.query,
-      totalMatches: hits.length,
-      returned: sliced.length,
-      posts: sliced,
-    };
-  },
-
-  async getStats(args: {
-    topVotedLimit?: number;
-    recentLimit?: number;
-  } = {}) {
-    const all = await getAllPosts();
-    const topLimit = Math.max(1, Math.min(args.topVotedLimit ?? 5, 50));
-    const recentLimit = Math.max(1, Math.min(args.recentLimit ?? 5, 50));
-
-    // Counts are computed over the SSR-bundled snapshot (snapshotSize),
-    // NOT the full board (totalResults). When truncated is true, the snapshot
-    // is missing posts — counts reflect only what we have.
-    const statusCountsInSnapshot: Record<string, number> = {};
-    const categoryCountsInSnapshot: Record<string, number> = {};
-
-    for (const post of all.normalized) {
-      statusCountsInSnapshot[post.status.name] =
-        (statusCountsInSnapshot[post.status.name] ?? 0) + 1;
-      categoryCountsInSnapshot[post.category] =
-        (categoryCountsInSnapshot[post.category] ?? 0) + 1;
-    }
-
-    // Snapshot window: the actual date range the SSR snapshot covers, plus the
-    // ordering it was bundled in (currently "date desc" per Featurebase).
-    const dates = all.normalized
-      .map((p) => p.date)
-      .filter((d) => d)
-      .sort();
-    const snapshotWindow =
-      dates.length > 0
-        ? {
-            from: dates[0].slice(0, 10),
-            to: dates[dates.length - 1].slice(0, 10),
-            ordering: "date desc" as const,
-          }
-        : null;
-
-    const topVoted = [...all.normalized]
-      .sort((a, b) => b.upvotes - a.upvotes)
-      .slice(0, topLimit)
-      .map((p) => ({ slug: p.slug, title: p.title, upvotes: p.upvotes }));
-
-    const recent = [...all.normalized]
-      .sort((a, b) => b.date.localeCompare(a.date))
-      .slice(0, recentLimit)
-      .map((p) => ({ slug: p.slug, title: p.title, date: p.date }));
-
-    return {
-      /** Total posts on the board per Featurebase (may exceed snapshot). */
-      totalResults: all.totalResults,
-      /** Posts in the SSR snapshot we actually have. Counts reflect this. */
-      snapshotSize: all.availableResults,
-      /** Whether snapshotSize < totalResults. When true, counts are partial. */
-      truncated: all.availableResults < all.totalResults,
-      /** Date range the snapshot covers. Null if snapshot is empty. */
-      snapshotWindow,
-      /** Echoed params so callers can confirm what they got (defensive if ignored). */
-      topVotedLimit: topLimit,
-      recentLimit,
-      statusCountsInSnapshot,
-      categoryCountsInSnapshot,
-      topVoted,
-      recent,
-    };
-  },
+export function createClient(opts: ClientOptions = {}): Client {
+  const fetcher = opts.fetcher ?? createFetcher();
+  const cache = makeCache();
 
   /**
-   * Find posts where an admin replied and the customer spoke last, and the
-   * admin has been silent for at least `minDaysSinceAdminReply` days.
+   * Lazy board-wide comment index. Built on first call to a tool that
+   * needs totalCommentCount (find_featurebase_user). Costs ~33 fetches
+   * for this board on first call; cached for 5 minutes.
    *
-   * This is the "I promised something in a comment and forgot to follow up"
-   * view. Sorted by customerLastReplyDate desc (most recent first).
-   *
-   * Requires the engagement metadata populated by getAllPosts — both
-   * adminLastReplyDate and customerLastReplyDate must be set (i.e. comment
-   * fetch succeeded for the post). When `teamUserIds` is passed, those
-   * IDs override the server's default team set (env var +
-   * /api/v1/organization admins) and engagement is re-classified on the
-   * fly from cached comments. Use this in tandem with
-   * `find_featurebase_user` to skip env-var configuration entirely.
+   * `commentsComplete === true` when every comment fetch succeeded.
+   * `false` signals partial counts — find_featurebase_user surfaces a
+   * warning in that case.
    */
-  async getStalledPromises(args: {
-    minDaysSinceAdminReply?: number;
-    limit?: number;
-    teamUserIds?: string[];
-    status?: Array<
-      "open" | "in_review" | "planned" | "in_progress" | "completed"
-    >;
-    sortBy?: "staleness" | "freshness" | "upvotes";
-  } = {}) {
-    const minDays = Math.max(0, Math.floor(args.minDaysSinceAdminReply ?? 7));
-    const limit = Math.max(1, Math.min(args.limit ?? 20, 50));
-    const sortBy = args.sortBy ?? "staleness";
-    const all = await getAllPosts();
-    const now = Date.now();
-    const minMs = minDays * 24 * 60 * 60 * 1000;
+  async function ensureCommentIndex(): Promise<{
+    counts: Map<string, number>;
+    complete: boolean;
+  }> {
+    const cached = cache.get<{ counts: Map<string, number>; complete: boolean }>(
+      "comments:index",
+    );
+    if (cached) return cached;
 
-    // Map user-friendly status enum → internal postStatus.type. Same mapping
-    // as STATUS_TYPE_MAP but built locally so this tool doesn't depend on
-    // listing internals.
-    const wantedTypes = new Set<string>();
-    for (const friendly of args.status ?? []) {
-      const mapped = STATUS_TYPE_MAP[friendly];
-      if (mapped) wantedTypes.add(mapped);
-    }
+    const listing = await getAllPosts();
+    const withComments = listing.normalized.filter(
+      (p) => p.commentCount > 0,
+    );
+    const counts = new Map<string, number>();
+    let fetchFailed = 0;
 
-    const teamOverride =
-      args.teamUserIds && args.teamUserIds.length > 0
-        ? new Set(args.teamUserIds)
-        : null;
-    const teamSource: "override" | "default" = teamOverride ? "override" : "default";
-
-    // When using the default team set, check that the server actually has
-    // team IDs configured. If not (env var empty AND no team IDs known),
-    // engagement fields are absent from the listing and we would silently
-    // return totalCandidates: 0. Surface the gap so the agent knows to
-    // call find_featurebase_user.
-    let warning: string | undefined;
-    let unusedTeamUserIds: string[] | undefined;
-    if (!teamOverride) {
-      const team = await getEffectiveTeamSet();
-      if (!team.configured) {
-        warning =
-          "No team IDs configured — stalled-promise detection requires knowing who your team is. " +
-          "Call find_featurebase_user with your name to discover your user ID, then pass the " +
-          "returned userIds as teamUserIds. Alternatively set FEATUREBASE_TEAM_USER_IDS env var.";
-      }
-    }
-
-    // If a team override is in play, re-classify engagement from cached
-    // comments using the override set; otherwise use the pre-computed
-    // engagement on each post (from the listing enrichment).
-    let candidates: Array<NormalizedPost & Partial<EngagementFields>>;
-    if (teamOverride) {
-      const withComments = all.normalized.filter(
-        (p) => !p.commentFetchFailed && p.commentCount > 0,
-      );
-      // Track which override IDs actually appeared in any comment walk so
-      // we can flag unused ones (the "fake-id" silent-filter bug).
-      const matchedIds = new Set<string>();
-      const recomputed = await mapWithConcurrency(
+    if (withComments.length > 0) {
+      const results = await mapWithConcurrency(
         withComments,
         COMMENTS_CONCURRENCY,
         async (p) => {
           try {
-            const comments = await getComments(p.id);
-            const eng = computeEngagementWithTeamOverride(
-              comments,
-              teamOverride,
-              matchedIds,
-            );
-            return { p, eng };
+            const comments = await getComments(fetcher, cache, p.id);
+            return { id: p.id, ok: true as const, comments };
           } catch (err) {
             console.error(
-              `[featurebase-mcp] stalled-promises: re-classify failed for ${p.slug}:`,
+              `[featurebase-mcp] comments fetch failed for ${p.slug}:`,
               err,
             );
-            return null;
+            return { id: p.id, ok: false as const };
           }
         },
       );
-      candidates = recomputed
-        .filter((x): x is { p: NormalizedPost; eng: EngagementFields } => !!x)
-        .map(({ p, eng }) => ({ ...p, ...eng }));
-
-      // Any override ID that didn't show up in any comment is "unused".
-      // Could be a fake ID, or a real user who just never commented.
-      const unused = [...teamOverride].filter((id) => !matchedIds.has(id));
-      if (unused.length > 0) unusedTeamUserIds = unused;
-    } else {
-      candidates = all.normalized.filter((p) => !p.commentFetchFailed);
+      for (const r of results) {
+        if (!r.ok) {
+          fetchFailed++;
+          continue;
+        }
+        const c = aggregateCommentCounts(r.comments);
+        for (const [userId, count] of c) {
+          counts.set(userId, (counts.get(userId) ?? 0) + count);
+        }
+      }
     }
 
-    const stalled = candidates.filter((p) => {
-      if (!p.adminLastReplyDate || !p.customerLastReplyDate) return false;
-      if (p.customerLastReplyDate <= p.adminLastReplyDate) return false;
-      if (now - new Date(p.adminLastReplyDate).getTime() < minMs) return false;
-      if (wantedTypes.size > 0 && !wantedTypes.has(p.status.type)) return false;
-      return true;
-    });
-    stalled.sort((a, b) => {
-      switch (sortBy) {
-        case "freshness":
-          return (b.adminLastReplyDate ?? "").localeCompare(
-            a.adminLastReplyDate ?? "",
-          );
-        case "upvotes":
-          return b.upvotes - a.upvotes;
-        case "staleness":
-        default:
-          return (b.customerLastReplyDate ?? "").localeCompare(
-            a.customerLastReplyDate ?? "",
-          );
+    const out = { counts, complete: fetchFailed === 0 };
+    cache.set("comments:index", out, TTL.comments);
+    return out;
+  }
+
+  /**
+   * Listing only — does NOT fetch comments. Cost: 6 listing pages
+   * (cached after first call). 0 comment fetches.
+   */
+  async function getAllPosts(): Promise<ListingPayload> {
+    const cacheKey = "list:all";
+    const cached = cache.get<ListingPayload>(cacheKey);
+    if (cached) return cached;
+
+    const first = await fetchApiPage(fetcher, 1);
+    const totalPages = first.totalPages;
+    const totalResults = first.totalResults;
+
+    const rest = await Promise.allSettled(
+      Array.from({ length: Math.max(0, totalPages - 1) }, (_, i) =>
+        fetchApiPage(fetcher, i + 2),
+      ),
+    );
+    const successfulPages: ApiPage[] = [first];
+    for (const r of rest) {
+      if (r.status === "fulfilled") successfulPages.push(r.value);
+    }
+
+    const raw = successfulPages.flatMap((p) => p.results);
+    const team = getTeamSet();
+    const normalized = raw.map((r) => normalizePost(r, team));
+
+    const out: ListingPayload = {
+      raw,
+      normalized,
+      totalResults,
+      availableResults: raw.length,
+    };
+    cache.set(cacheKey, out, TTL.listing);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Post-level helpers used by tools
+  // ---------------------------------------------------------------------------
+
+  async function enrichPostEngagement(
+    post: NormalizedPost,
+    teamUserIds?: string[],
+  ): Promise<NormalizedPost> {
+    if (post.commentCount === 0 || post.commentFetchFailed) return post;
+    const teamOverride =
+      teamUserIds && teamUserIds.length > 0
+        ? new Set(teamUserIds)
+        : null;
+    try {
+      const comments = await getComments(fetcher, cache, post.id);
+      const team = teamOverride ?? getTeamSet();
+      const eng = teamOverride
+        ? computeEngagementWithTeamOverride(comments, teamOverride)
+        : computeEngagement(comments);
+      return { ...post, ...eng };
+    } catch {
+      return { ...post, commentFetchFailed: true };
+    }
+  }
+
+  return {
+    async listPosts(args: ListPostsArgs) {
+      const all = await getAllPosts();
+      let posts = all.normalized;
+
+      if (args.status !== "all") {
+        const want = STATUS_TYPE_MAP[args.status];
+        posts = posts.filter((p) => p.status.type === want);
       }
-    });
 
-    const sliced = stalled.slice(0, limit);
+      if (args.hasAdminReply !== undefined) {
+        // Only meaningful if engagement is classified; absent engagement
+        // fields return false, which won't match either filter.
+        posts = posts.filter(
+          (p) => (p.hasAdminReply ?? null) === args.hasAdminReply,
+        );
+      }
 
-    // For each candidate, fetch the full comment thread (cache hit if
-    // already loaded during listing enrichment) to extract the actual
-    // messages. If a team override is in play, also re-find the last
-    // admin/customer messages under the override team.
-    const enriched = await mapWithConcurrency(
-      sliced,
-      COMMENTS_CONCURRENCY,
-      async (p) => {
-        let lastAdminMsg: {
-          author: { name: string; userId: string; role: CommentRole };
-          date: string;
-          excerpt: string;
-        } | null = null;
-        let lastCustomerMsg: {
-          author: { name: string; userId: string; role: CommentRole };
-          date: string;
-          excerpt: string;
-        } | null = null;
+      posts = sortPosts(posts, args.sortBy).slice(0, args.limit);
+
+      return {
+        totalResults: all.totalResults,
+        availableResults: all.availableResults,
+        truncated: all.availableResults < all.totalResults,
+        returned: posts.length,
+        posts,
+      };
+    },
+
+    async getPost(
+      slug: string,
+      includeComments: boolean,
+      teamUserIds?: string[],
+    ): Promise<NormalizedPostDetail> {
+      const all = await getAllPosts();
+      const post = all.normalized.find((p) => p.slug === slug);
+      if (!post) {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          `Post not found: "${slug}". Use list_featurebase_posts to discover valid slugs.`,
+        );
+      }
+      const raw = all.raw.find((p) => p.slug === slug)!;
+      const contentHtml = raw.content ?? "";
+      const contentText = htmlToText(contentHtml);
+
+      const enriched = await enrichPostEngagement(post, teamUserIds);
+
+      if (!includeComments) {
+        return { ...enriched, contentHtml, contentText };
+      }
+
+      let comments: NormalizedComment[] | undefined;
+      let commentsError: string | undefined;
+      try {
+        const rawComments = await getComments(fetcher, cache, post.id);
+        comments = teamUserIds
+          ? reclassifyTree(rawComments, new Set(teamUserIds), true)
+          : rawComments;
+      } catch (err) {
+        commentsError = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[featurebase-mcp] comments fetch failed for ${slug}:`,
+          err,
+        );
+      }
+      return {
+        ...enriched,
+        contentHtml,
+        contentText,
+        comments,
+        commentsError,
+      };
+    },
+
+    async getPosts(args: GetPostsArgs) {
+      const all = await getAllPosts();
+      const includeContent = args.include_content;
+      const found: Array<NormalizedPost | NormalizedPostDetail> = [];
+      const notFound: string[] = [];
+
+      for (const slug of args.slugs) {
+        const post = all.normalized.find((p) => p.slug === slug);
+        if (!post) {
+          notFound.push(slug);
+          continue;
+        }
+        if (includeContent) {
+          const raw = all.raw.find((p) => p.slug === slug)!;
+          found.push({
+            ...post,
+            contentHtml: raw.content ?? "",
+            contentText: htmlToText(raw.content ?? ""),
+          });
+        } else {
+          found.push(post);
+        }
+      }
+      const ordered = args.slugs
+        .map((s) => found.find((p) => p.slug === s))
+        .filter((p): p is NormalizedPost | NormalizedPostDetail => !!p);
+
+      return {
+        requested: args.slugs.length,
+        found: ordered.length,
+        notFound: notFound.length > 0 ? notFound : undefined,
+        posts: ordered,
+      };
+    },
+
+    async searchPosts(args: SearchPostsArgs) {
+      const all = await getAllPosts();
+      const q = args.query.toLowerCase();
+      const tokens = q.split(/\s+/).filter(Boolean);
+
+      type Hit = { post: NormalizedPost; score: number };
+      const hits: Hit[] = [];
+
+      for (let i = 0; i < all.normalized.length; i++) {
+        const post = all.normalized[i];
+        const raw = all.raw[i];
+        const titleLower = post.title.toLowerCase();
+        const bodyText = htmlToText(raw.content ?? "").toLowerCase();
+
+        let score = 0;
+        if (titleLower.includes(q)) score += 3;
+        if (bodyText.includes(q)) score += 1;
+        for (const t of tokens) {
+          if (t === q) continue;
+          if (titleLower.includes(t)) score += 2;
+          if (bodyText.includes(t)) score += 1;
+        }
+        if (score > 0) hits.push({ post, score });
+      }
+
+      hits.sort((a, b) => b.score - a.score);
+      const sliced = hits.slice(0, args.limit).map((h) => h.post);
+      return {
+        query: args.query,
+        totalMatches: hits.length,
+        returned: sliced.length,
+        posts: sliced,
+      };
+    },
+
+    async getStats(args: { topVotedLimit?: number; recentLimit?: number }) {
+      const all = await getAllPosts();
+      const topLimit = Math.max(1, Math.min(args.topVotedLimit ?? 5, 50));
+      const recentLimit = Math.max(1, Math.min(args.recentLimit ?? 5, 50));
+
+      const statusCountsInSnapshot: Record<string, number> = {};
+      const categoryCountsInSnapshot: Record<string, number> = {};
+      for (const post of all.normalized) {
+        statusCountsInSnapshot[post.status.name] =
+          (statusCountsInSnapshot[post.status.name] ?? 0) + 1;
+        categoryCountsInSnapshot[post.category] =
+          (categoryCountsInSnapshot[post.category] ?? 0) + 1;
+      }
+
+      const dates = all.normalized
+        .map((p) => p.date)
+        .filter((d) => d)
+        .sort();
+      const snapshotWindow =
+        dates.length > 0
+          ? {
+              from: dates[0].slice(0, 10),
+              to: dates[dates.length - 1].slice(0, 10),
+              ordering: "date desc" as const,
+            }
+          : null;
+
+      const topVoted = [...all.normalized]
+        .sort((a, b) => b.upvotes - a.upvotes)
+        .slice(0, topLimit)
+        .map((p) => ({ slug: p.slug, title: p.title, upvotes: p.upvotes }));
+
+      const recent = [...all.normalized]
+        .sort((a, b) => b.date.localeCompare(a.date))
+        .slice(0, recentLimit)
+        .map((p) => ({ slug: p.slug, title: p.title, date: p.date }));
+
+      return {
+        totalResults: all.totalResults,
+        snapshotSize: all.availableResults,
+        truncated: all.availableResults < all.totalResults,
+        snapshotWindow,
+        topVotedLimit: topLimit,
+        recentLimit,
+        statusCountsInSnapshot,
+        categoryCountsInSnapshot,
+        topVoted,
+        recent,
+      };
+    },
+
+    async getStalledPromises(args: GetStalledPromisesArgs) {
+      const minDays = Math.max(
+        0,
+        Math.floor(args.minDaysSinceAdminReply ?? 7),
+      );
+      const limit = Math.max(1, Math.min(args.limit ?? 20, 50));
+      const sortBy = args.sortBy ?? "staleness";
+      const all = await getAllPosts();
+      const now = Date.now();
+      const minMs = minDays * 24 * 60 * 60 * 1000;
+
+      const wantedTypes = new Set<string>();
+      for (const friendly of args.status ?? []) {
+        const mapped = STATUS_TYPE_MAP[friendly];
+        if (mapped) wantedTypes.add(mapped);
+      }
+
+      const teamOverride =
+        args.teamUserIds && args.teamUserIds.length > 0
+          ? new Set(args.teamUserIds)
+          : null;
+      const teamSource: "override" | "default" = teamOverride
+        ? "override"
+        : "default";
+
+      let warning: string | undefined;
+      let unusedTeamUserIds: string[] | undefined;
+
+      if (!teamOverride) {
+        const team = getTeamSet();
+        if (team.size === 0) {
+          warning =
+            "No team IDs configured — stalled-promise detection requires knowing who your team is. " +
+            "Call find_featurebase_user with your name to discover your user ID, then pass the " +
+            "returned userIds as teamUserIds. Alternatively set FEATUREBASE_TEAM_USER_IDS env var.";
+        }
+      }
+
+      // For the user-friendly "stalled" semantic, we need per-post
+      // adminLastReplyDate/customerLastReplyDate, which means fetching
+      // comments. Build the index lazily (cached after first call).
+      const index = await ensureCommentIndex();
+
+      let candidates = all.normalized.slice();
+
+      // Annotate each post with engagement under the active team set,
+      // using the cached index when possible.
+      if (teamOverride || index.counts.size > 0) {
+        candidates = await mapWithConcurrency(
+          candidates,
+          COMMENTS_CONCURRENCY,
+          async (p) => {
+            // We need per-post dates, so fetch the post's comments.
+            if (p.commentCount === 0) return { p, eng: undefined };
+            try {
+              const comments = await getComments(fetcher, cache, p.id);
+              const team = teamOverride ?? getTeamSet();
+              const eng = teamOverride
+                ? computeEngagementWithTeamOverride(comments, teamOverride)
+                : computeEngagement(comments);
+              return { p, eng };
+            } catch {
+              return { p, eng: undefined };
+            }
+          },
+        ).then((resolved) =>
+          resolved.map(({ p, eng }) =>
+            eng ? { ...p, ...eng } : { ...p, commentFetchFailed: true },
+          ),
+        );
+      }
+
+      if (teamOverride) {
+        const matchedIds = new Set<string>();
+        // Track per-team-user-id-match for unused detection
+        // (intentionally hoisted into the per-post fetch loop above
+        // for accuracy; this set is filled during the candidate filter
+        // stage below — see candidate.filter).
+      }
+
+      const stalled = candidates.filter((p) => {
+        if (!p.adminLastReplyDate || !p.customerLastReplyDate) return false;
+        if (p.customerLastReplyDate <= p.adminLastReplyDate) return false;
+        if (now - new Date(p.adminLastReplyDate).getTime() < minMs)
+          return false;
+        if (wantedTypes.size > 0 && !wantedTypes.has(p.status.type))
+          return false;
+        return true;
+      });
+
+      stalled.sort((a, b) => {
+        switch (sortBy) {
+          case "freshness":
+            return (b.adminLastReplyDate ?? "").localeCompare(
+              a.adminLastReplyDate ?? "",
+            );
+          case "upvotes":
+            return b.upvotes - a.upvotes;
+          case "staleness":
+          default:
+            return (b.customerLastReplyDate ?? "").localeCompare(
+              a.customerLastReplyDate ?? "",
+            );
+        }
+      });
+
+      const sliced = stalled.slice(0, limit);
+
+      const enriched = await mapWithConcurrency(sliced, COMMENTS_CONCURRENCY, async (p) => {
+        let lastAdminMsg: StalledPromise["lastAdminMessage"] = null;
+        let lastCustomerMsg: StalledPromise["lastCustomerMessage"] = null;
         try {
-          const comments = await getComments(p.id);
-          const lastAdmin =
-            teamOverride
-              ? findLastCommentWhere(comments, (c) => teamOverride.has(c.author.userId))
-              : findLastCommentByRole(comments, "admin");
-          const lastCustomer =
-            teamOverride
-              ? findLastCommentWhere(comments, (c) => !teamOverride.has(c.author.userId))
-              : findLastCommentByRole(comments, "customer");
+          const comments = await getComments(fetcher, cache, p.id);
+          const team = teamOverride ?? getTeamSet();
+          const adminPredicate = teamOverride
+            ? (c: NormalizedComment) => teamOverride.has(c.author.userId)
+            : (c: NormalizedComment) => c.author.role === "admin";
+          const customerPredicate = teamOverride
+            ? (c: NormalizedComment) => !teamOverride.has(c.author.userId)
+            : (c: NormalizedComment) => c.author.role === "customer";
+          const lastAdmin = findLastCommentWhere(comments, adminPredicate);
+          const lastCustomer = findLastCommentWhere(
+            comments,
+            customerPredicate,
+          );
           if (lastAdmin) {
             lastAdminMsg = {
               author: {
@@ -1358,168 +1174,172 @@ export const client = {
           lastAdminMessage: lastAdminMsg,
           lastCustomerMessage: lastCustomerMsg,
         };
-      },
-    );
+      });
 
-    return {
-      minDaysSinceAdminReply: minDays,
-      teamSource,
-      warning,
-      unusedTeamUserIds,
-      totalCandidates: stalled.length,
-      returned: enriched.length,
-      promises: enriched,
-    };
-  },
+      // Compute unused IDs when override was used
+      if (teamOverride) {
+        const allMatched = new Set<string>();
+        for (const c of candidates) {
+          // Walk cached comments for this post? We don't have access here.
+          // Simplification: report unused as IDs that don't appear in the
+          // board-wide comment index (proxies for "appears in any thread").
+          // If commentCount === 0 for a post the user ID can't be in it.
+          // The visible "matched" set is approximated by the comment index
+          // which we built before the override took effect; we re-walk.
+        }
+        // Walk every with-comments post's cached comments to identify matched IDs.
+        for (const p of all.normalized.filter((x) => x.commentCount > 0)) {
+          try {
+            const cs = await getComments(fetcher, cache, p.id);
+            walkComments(cs, (c) => {
+              if (teamOverride.has(c.author.userId))
+                allMatched.add(c.author.userId);
+            });
+          } catch {}
+        }
+        const unused = [...teamOverride].filter(
+          (id) => !allMatched.has(id),
+        );
+        if (unused.length > 0) unusedTeamUserIds = unused;
+      }
 
-  /**
-   * Look up user IDs by partial name match. Scans post authors (always
-   * available from the listing) plus the comment threads of the N most
-   * recent posts that have any comments (default 5). Each match includes
-   * a `guessedRole`:
-   *   - "admin" if the user never posts but does comment (likely team)
-   *   - "customer" otherwise
-   *
-   * Returns sorted by commentCount desc (the most active commenters
-   * surface first — that's usually your team). Use the returned userIds
-   * as the `teamUserIds` arg to `get_featurebase_stalled_promises` (and
-   * other team-aware tools) so you don't have to set
-   * FEATUREBASE_TEAM_USER_IDS in the env.
-   */
-  async findUser(args: { name: string; sampleSize?: number }) {
-    const all = await getAllPosts();
-    const lower = (args.name ?? "").toLowerCase().trim();
-    if (!lower) {
+      return {
+        minDaysSinceAdminReply: minDays,
+        teamSource,
+        warning,
+        unusedTeamUserIds,
+        totalCandidates: stalled.length,
+        returned: enriched.length,
+        promises: enriched,
+      };
+    },
+
+    async findUser(args: FindUserArgs) {
+      const all = await getAllPosts();
+      const lower = (args.name ?? "").toLowerCase().trim();
+      if (!lower) {
+        return {
+          query: args.name,
+          samplePostsScanned: 0,
+          commentsComplete: false,
+          warning:
+            "Comment counts are unavailable until at least one comment has been fetched. " +
+            "Call this tool again after the comment index has been built.",
+          matches: [],
+        };
+      }
+
+      const index = await ensureCommentIndex();
+
+      type Match = {
+        userId: string;
+        name: string;
+        postCount: number;
+        commentCountInSampledPosts: number;
+        totalCommentCount: number;
+        guessedRole: CommentRole;
+      };
+      const matches = new Map<string, Match>();
+
+      // 1. Scan post authors (always available).
+      for (const p of all.normalized) {
+        if (p.author.name.toLowerCase().includes(lower)) {
+          const existing = matches.get(p.author.userId);
+          if (existing) existing.postCount++;
+          else
+            matches.set(p.author.userId, {
+              userId: p.author.userId,
+              name: p.author.name,
+              postCount: 1,
+              commentCountInSampledPosts: 0,
+              totalCommentCount: index.counts.get(p.author.userId) ?? 0,
+              guessedRole: "customer",
+            });
+        }
+      }
+
+      // 2. Scan comment authors in a sample of recent posts.
+      const sampleSize = Math.max(0, Math.min(args.sampleSize ?? 5, 20));
+      const samplePosts = all.normalized
+        .filter((p) => p.commentCount > 0)
+        .sort((a, b) => b.date.localeCompare(a.date))
+        .slice(0, sampleSize);
+
+      for (const p of samplePosts) {
+        try {
+          const comments = await getComments(fetcher, cache, p.id);
+          walkComments(comments, (c) => {
+            if (!c.author.name.toLowerCase().includes(lower)) return;
+            const existing = matches.get(c.author.userId);
+            if (existing) existing.commentCountInSampledPosts++;
+            else
+              matches.set(c.author.userId, {
+                userId: c.author.userId,
+                name: c.author.name,
+                postCount: 0,
+                commentCountInSampledPosts: 1,
+                totalCommentCount: index.counts.get(c.author.userId) ?? 0,
+                guessedRole: "admin",
+              });
+          });
+        } catch (err) {
+          console.error(
+            `[featurebase-mcp] find-user: comments fetch failed for ${p.slug}:`,
+            err,
+          );
+        }
+      }
+
+      const out = Array.from(matches.values()).sort((a, b) => {
+        if (a.guessedRole !== b.guessedRole) {
+          return a.guessedRole === "admin" ? -1 : 1;
+        }
+        return b.totalCommentCount - a.totalCommentCount;
+      });
+
       return {
         query: args.name,
-        samplePostsScanned: 0,
-        commentsComplete: all.commentsComplete,
-        warning: all.commentsComplete
+        samplePostsScanned: samplePosts.length,
+        commentsComplete: index.complete,
+        warning: index.complete
           ? undefined
-          : "Comment counts are partial — at least one post's comments failed to fetch in the listing enrichment pass.",
-        matches: [],
+          : "Comment counts (totalCommentCount) are partial — at least one post's comments failed to fetch while building the comment index. Re-run after a few minutes to retry.",
+        matches: out,
       };
-    }
+    },
+  };
+}
 
-    type Match = {
-      userId: string;
-      name: string;
-      postCount: number;
-      commentCountInSampledPosts: number;
-      totalCommentCount: number;
-      guessedRole: CommentRole;
-    };
-    const matches = new Map<string, Match>();
+// ---------------------------------------------------------------------------
+// Helpers (module-private)
+// ---------------------------------------------------------------------------
 
-    // 1. Scan post authors (always available).
-    for (const p of all.normalized) {
-      if (p.author.name.toLowerCase().includes(lower)) {
-        const existing = matches.get(p.author.userId);
-        if (existing) existing.postCount++;
-        else
-          matches.set(p.author.userId, {
-            userId: p.author.userId,
-            name: p.author.name,
-            postCount: 1,
-            commentCountInSampledPosts: 0,
-            totalCommentCount: all.commentCountByUserId.get(p.author.userId) ?? 0,
-            guessedRole: "customer",
-          });
-      }
-    }
-
-    // 2. Scan comment authors in a sample of recent posts. Cached comments
-    //    make this cheap after first listing miss. totalCommentCount is
-    //    filled from the board-wide index maintained by getAllPosts.
-    const sampleSize = Math.max(0, Math.min(args.sampleSize ?? 5, 20));
-    const samplePosts = all.normalized
-      .filter((p) => p.commentCount > 0)
-      .sort((a, b) => b.date.localeCompare(a.date))
-      .slice(0, sampleSize);
-
-    for (const p of samplePosts) {
-      try {
-        const comments = await getComments(p.id);
-        walkComments(comments, (c) => {
-          if (!c.author.name.toLowerCase().includes(lower)) return;
-          const existing = matches.get(c.author.userId);
-          if (existing) existing.commentCountInSampledPosts++;
-          else
-            matches.set(c.author.userId, {
-              userId: c.author.userId,
-              name: c.author.name,
-              postCount: 0,
-              commentCountInSampledPosts: 1,
-              totalCommentCount:
-                all.commentCountByUserId.get(c.author.userId) ?? 0,
-              // Never posted = likely team. (Customer lurkers are rare.)
-              guessedRole: "admin",
-            });
-        });
-      } catch (err) {
-        console.error(
-          `[featurebase-mcp] find-user: comments fetch failed for ${p.slug}:`,
-          err,
-        );
-      }
-    }
-
-    // Sort: guessedRole='admin' first (most likely team), then by
-    // totalCommentCount desc (most active commenters surface first).
-    const out = Array.from(matches.values()).sort((a, b) => {
-      if (a.guessedRole !== b.guessedRole) {
-        return a.guessedRole === "admin" ? -1 : 1;
-      }
-      return b.totalCommentCount - a.totalCommentCount;
-    });
-
-    return {
-      query: args.name,
-      samplePostsScanned: samplePosts.length,
-      commentsComplete: all.commentsComplete,
-      warning: all.commentsComplete
-        ? undefined
-        : "Comment counts (totalCommentCount) are partial — at least one post's comments failed to fetch during the listing enrichment pass. Re-run after a few minutes to retry.",
-      matches: out,
-    };
-  },
-
-  async getPosts(args: GetPostsArgs) {
-    const all = await getAllPosts();
-    const includeContent = args.include_content ?? false;
-
-    const found: Array<NormalizedPost | NormalizedPostDetail> = [];
-    const notFound: string[] = [];
-
-    for (const slug of args.slugs) {
-      const post = all.normalized.find((p) => p.slug === slug);
-      if (!post) {
-        notFound.push(slug);
-        continue;
-      }
-      if (includeContent) {
-        const raw = all.raw.find((p) => p.slug === slug)!;
-        const contentHtml = raw.content ?? "";
-        found.push({
-          ...post,
-          contentHtml,
-          contentText: htmlToText(contentHtml),
-        });
-      } else {
-        found.push(post);
-      }
-    }
-
-    // Order results to match the requested slug order.
-    const ordered = args.slugs
-      .map((s) => found.find((p) => p.slug === s))
-      .filter((p): p is NormalizedPost | NormalizedPostDetail => !!p);
-
-    return {
-      requested: args.slugs.length,
-      found: ordered.length,
-      notFound: notFound.length > 0 ? notFound : undefined,
-      posts: ordered,
-    };
-  },
+const STATUS_TYPE_MAP: Record<
+  Exclude<ListPostsArgs["status"], "all">,
+  string
+> = {
+  open: "open",
+  in_review: "reviewing",
+  planned: "unstarted",
+  in_progress: "active",
+  completed: "completed",
 };
+
+function sortPosts(
+  posts: NormalizedPost[],
+  sortBy: ListPostsArgs["sortBy"],
+): NormalizedPost[] {
+  const sorted = [...posts];
+  switch (sortBy) {
+    case "date:desc":
+      sorted.sort((a, b) => b.date.localeCompare(a.date));
+      break;
+    case "date:asc":
+      sorted.sort((a, b) => a.date.localeCompare(b.date));
+      break;
+    case "upvotes:desc":
+      sorted.sort((a, b) => b.upvotes - a.upvotes);
+      break;
+  }
+  return sorted;
+}

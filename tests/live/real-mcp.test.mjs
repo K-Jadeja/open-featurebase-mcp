@@ -1,3 +1,9 @@
+
+// LIVE-INTEGRATION: only runs when LIVE=1.
+if (process.env.LIVE !== '1') {
+  console.log('  [skipped, set LIVE=1 to run]');
+  process.exit(0);
+}
 // Comprehensive real-MCP-transport test via SDK's StdioClientTransport.
 // Verifies per the audit's required gates:
 //   - clean validation text (single line, no Zod internals)

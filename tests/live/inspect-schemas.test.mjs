@@ -1,3 +1,9 @@
+
+// LIVE-INTEGRATION: only runs when LIVE=1.
+if (process.env.LIVE !== '1') {
+  console.log('  [skipped, set LIVE=1 to run]');
+  process.exit(0);
+}
 // Inspect what MCP clients see via listTools — must show REAL schemas.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";

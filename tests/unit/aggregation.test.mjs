@@ -1,7 +1,7 @@
 // Deterministic unit tests for comment-count aggregation. Pure function
 // over synthetic NormalizedComment trees — no network, no MCP.
 
-import { aggregateCommentCounts } from "../dist/index.js";
+import { aggregateCommentCounts } from "../../dist/aggregation.js";
 
 let passed = 0, failed = 0;
 function check(name, cond) {

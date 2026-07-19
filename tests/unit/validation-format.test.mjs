@@ -3,7 +3,7 @@
 // as production code sees it.
 
 import { z } from "zod";
-import { formatZodIssue } from "../dist/index.js";
+import { formatZodIssue } from "../../dist/validation.js";
 
 let passed = 0, failed = 0;
 function check(name, cond) {

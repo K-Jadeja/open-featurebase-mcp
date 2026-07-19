@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { client } from "../client.js";
+import { createClient } from "../client.js";
+const client = createClient();
 
 export const GetStatsArgsSchema = {
   topVotedLimit: z
