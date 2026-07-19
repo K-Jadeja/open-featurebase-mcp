@@ -8,6 +8,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { listPosts, ListPostsArgsSchema } from "./tools/list-posts.js";
@@ -18,72 +19,51 @@ import { getStats, GetStatsArgsSchema } from "./tools/get-stats.js";
 import { getStalledPromises, GetStalledPromisesArgsSchema } from "./tools/get-stalled-promises.js";
 import { findUser, FindUserArgsSchema } from "./tools/find-user.js";
 
-const server = new McpServer({
-  name: "featurebase-mcp",
-  version: "1.0.0",
-});
-
 // ---------------------------------------------------------------------------
-// Clean Zod validation errors via prototype override + path-keyed input cache.
+// Per-tool validation wrapper.
 //
-// Background: when validation fails, Zod throws a ZodError whose `.message`
-// is `JSON.stringify(issues, null, 2)`. The MCP SDK then surfaces that
-// message back to the agent, leaking the entire issues array
-// ([{code, path, inclusive, exact, message, ...}]) along with the useful
-// string. Earlier rounds tried to fix this via a custom global errorMap
-// (formatted each issue's `message` field), but Zod ignores the message
-// reformat for the SDK path because ZodError wraps everything in JSON
-// before the SDK reads it.
+// Why we don't use the SDK's built-in Zod validation: it formats errors
+// by JSON.stringify-ing the issues array, exposing Zod's internal shape
+// (code, path, inclusive, exact, etc.) alongside any custom message. A
+// previous fix (ZodError.prototype.message override) was hacky and
+// unsafe — global state, leaks across requests, breaks Zod in isolation.
 //
-// This patch has two pieces:
+// This helper runs at the MCP tool boundary, request-scoped (no shared
+// state). It does NOT mutate Zod globally. It does NOT echo arbitrary
+// input values into the response — only field names + constraints, so
+// secrets or large payloads cannot leak via a validation error.
 //
-// 1. A global errorMap that captures the failing value (`ctx.data`) into
-//    a path-keyed Map. We can't mutate the issue directly — Zod's
-//    `makeIssue` builds a fresh issue object AFTER errorMap returns and
-//    discards any properties we set. Path is unique enough for our
-//    flat argument shapes; collisions only matter if the same field
-//    triggers multiple error codes, which doesn't happen in practice.
-//
-// 2. A `ZodError.prototype.message` getter override that joins
-//    pre-formatted per-issue messages into one clean line:
-//      "minDaysSinceAdminReply: must be at most 365 (got 9999)"
-//    instead of:
-//      "[ { code: 'too_big', maximum: 365, ... } ]"
-//    `configurable: true` lets us re-define the property; the setter on
-//    the prototype absorbs ZodError's constructor's
-//    `this.message = JSON.stringify(...)` call and discards it.
+// We register tools via registerTool(name, config, cb) (config-object
+// form) so the SDK accepts a passthrough ZodObject as inputSchema
+// without re-introducing the JSON.stringify error format. The position-
+// arg form rejects ZodObject via its arg-shape check.
 // ---------------------------------------------------------------------------
 
-const OrigZodError = z.ZodError;
+/**
+ * Permissive tool-args schema. `.passthrough()` accepts any object and
+ * preserves unknown keys in the parsed output. Real validation happens
+ * inside our wrapper (clean text, request-scoped, no Zod internals, no
+ * echoed values). The as-any cast bypasses TypeScript's ZodRawShape
+ * union constraint; the runtime value is unchanged.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const ANY_ARGS = z.object({}).passthrough() as any;
 
-// Per-issue data captured during validation. Keyed by JSON-stringified path.
-// Cleared on a per-validation basis would be cleaner but adds bookkeeping
-// for negligible benefit — the captured values are only read in the
-// prototype getter that fires when the same process is throwing the same
-// error to the same agent.
-const dataByPath = new Map<string, unknown>();
-
-z.setErrorMap((issue, ctx) => {
-  const path = (issue.path ?? []).join(".") || "(root)";
-  dataByPath.set(path, ctx.data);
-  return { message: issue.message ?? "" };
-});
-
-const formatIssue = (issue: z.ZodIssue): string => {
+/**
+ * Format a Zod issue into a clean human-readable string. Bounds and
+ * expected types only — never the failing value.
+ */
+function formatZodIssue(issue: z.ZodIssue): string {
   const path = (issue.path ?? []).join(".") || "argument";
-  const inputVal = dataByPath.get(path);
-  const got =
-    inputVal === undefined ? "" : ` (got ${JSON.stringify(inputVal)})`;
-
   switch (issue.code) {
     case "too_big":
       return `${path}: must be at most ${issue.maximum}${
         issue.inclusive ? "" : " (exclusive)"
-      }${got}`;
+      }`;
     case "too_small":
       return `${path}: must be at least ${issue.minimum}${
         issue.inclusive ? "" : " (exclusive)"
-      }${got}`;
+      }`;
     case "invalid_type":
       return `${path}: expected ${issue.expected}, received ${issue.received}`;
     case "invalid_enum_value":
@@ -95,104 +75,151 @@ const formatIssue = (issue: z.ZodIssue): string => {
     default:
       return `${path}: ${issue.message ?? "invalid"}`;
   }
-};
+}
 
-Object.defineProperty(OrigZodError.prototype, "message", {
-  get(this: z.ZodError) {
-    if (!this.issues || this.issues.length === 0) return "";
-    return this.issues.map(formatIssue).join("; ");
-  },
-  set(_value: unknown) {
-    // Absorb constructor's `this.message = JSON.stringify(...)` and let our
-    // getter do all formatting.
-  },
-  configurable: true,
+/**
+ * Validate raw input against a strict Zod schema at the MCP boundary.
+ * Throws a single McpError whose message is the joined clean issue text.
+ * No module-level caches — concurrent requests cannot contaminate each
+ * other.
+ */
+function validateArgs<S extends z.ZodTypeAny>(schema: S, raw: unknown): z.infer<S> {
+  const result = schema.safeParse(raw);
+  if (!result.success) {
+    const messages = result.error.issues.map(formatZodIssue).join("; ");
+    throw new McpError(ErrorCode.InvalidParams, messages);
+  }
+  return result.data;
+}
+
+/**
+ * Build a tool handler that validates its arguments against `shape` and
+ * then calls `handler(validated)`. The closure holds no state; safe under
+ * concurrency.
+ */
+function withValidation<S extends z.ZodRawShape>(
+  shape: S,
+  handler: (args: z.output<z.ZodObject<S>>) => Promise<{
+    content: Array<{ type: "text"; text: string }>;
+  }>,
+) {
+  const schema = z.object(shape);
+  return async (raw: unknown) => handler(validateArgs(schema, raw));
+}
+
+const server = new McpServer({
+  name: "featurebase-mcp",
+  version: "1.0.0",
 });
 
-server.tool(
+// ---------------------------------------------------------------------------
+// Tool registrations via registerTool() (config-object form).
+// Position-arg form (server.tool) rejected ZodObject via isZodRawShapeCompat
+// and dropped args via executeToolHandler's no-inputSchema branch; config-
+// object form accepts a ZodObject directly via getZodSchemaObject.
+// ---------------------------------------------------------------------------
+
+server.registerTool(
   "list_featurebase_posts",
-  "List posts on the configured Featurebase feedback board. " +
-    "Optionally filter by status (open/planned/in_progress/complete/all) " +
-    "and sort by date or upvotes. Returns slug, title, status, vote count, " +
-    "comment count, author, date, and a plain-text excerpt of the body.",
-  ListPostsArgsSchema,
-  listPosts,
+  {
+    description:
+      "List posts on the configured Featurebase feedback board. " +
+      "Optionally filter by status, sort by date/upvotes, restrict to " +
+      "posts where the team has commented via hasAdminReply.",
+    inputSchema: ANY_ARGS,
+  },
+  withValidation(ListPostsArgsSchema, listPosts),
 );
 
-server.tool(
+server.registerTool(
   "get_featurebase_post",
-  "Get a single post by its slug. ALWAYS returns the full body " +
-    "(contentHtml + contentText inlined on the post object) — there is no " +
-    "content switch on this endpoint. Set include_comments=true to also " +
-    "inline the full comment thread as a nested `comments` array; each " +
-    "comment carries author.role='admin'|'customer' so the agent can " +
-    "distinguish team replies from customer messages. The post's " +
-    "commentCount is always returned in the metadata.",
-  GetPostArgsSchema,
-  getPost,
+  {
+    description:
+      "Get a single post by its slug. ALWAYS returns the full body " +
+      "(contentHtml + contentText inlined on the post object). Set " +
+      "include_comments=true to also inline the full comment thread as " +
+      "a nested comments array; each comment carries author.role so the " +
+      "agent can distinguish team replies from customer messages. " +
+      "Optional teamUserIds overrides the configured team set for role " +
+      "tagging.",
+    inputSchema: ANY_ARGS,
+  },
+  withValidation(GetPostArgsSchema, getPost),
 );
 
-server.tool(
+server.registerTool(
   "get_featurebase_posts",
-  "Batch fetch multiple posts in one call. Pass an array of slugs; returns " +
-    "matching posts in the order requested. Posts not in the snapshot are " +
-    "listed in a `notFound` field rather than throwing. Set include_content=true " +
-    "to inline full contentHtml + contentText on each post (otherwise only the " +
-    "800-char excerpt is returned). When to use: singular get_featurebase_post " +
-    "for 1–3 posts (always returns full body), this batch tool for 4+ posts " +
-    "(lighter, opt-in full body, partial-miss tolerant).",
-  GetPostsArgsSchema,
-  getPosts,
+  {
+    description:
+      "Batch fetch multiple posts in one call. Pass an array of slugs; " +
+      "returns matching posts in the order requested. Posts not in the " +
+      "snapshot are listed in a notFound field rather than throwing. " +
+      "Set include_content=true to inline full contentHtml + " +
+      "contentText on each post (otherwise only the 800-char excerpt " +
+      "is returned).",
+    inputSchema: ANY_ARGS,
+  },
+  withValidation(GetPostsArgsSchema, getPosts),
 );
 
-server.tool(
+server.registerTool(
   "search_featurebase_posts",
-  "Search the Featurebase board by keyword. Matches against post titles " +
-    "(weighted 3x) and bodies (1x), with per-token matching for multi-word " +
-    "queries. Returns up to N posts ordered by relevance score.",
-  SearchPostsArgsSchema,
-  searchPosts,
+  {
+    description:
+      "Search the Featurebase board by keyword. Matches against post " +
+      "titles (weighted 3x) and bodies (1x), with per-token matching " +
+      "for multi-word queries. Returns up to N posts ordered by " +
+      "relevance score.",
+    inputSchema: ANY_ARGS,
+  },
+  withValidation(SearchPostsArgsSchema, searchPosts),
 );
 
-server.tool(
+server.registerTool(
   "get_featurebase_stats",
-  "Aggregate statistics for the Featurebase board: total post count, " +
-    "counts grouped by status and category, the N most-upvoted posts " +
-    "(topVotedLimit, default 5), and the N most recent posts " +
-    "(recentLimit, default 5). Also returns snapshotWindow describing " +
-    "the date range the SSR snapshot actually covers.",
-  GetStatsArgsSchema,
-  getStats,
+  {
+    description:
+      "Aggregate statistics for the Featurebase board: total post " +
+      "count, counts grouped by status and category, the N most-" +
+      "upvoted posts, and the N most recent posts. Also returns " +
+      "snapshotWindow describing the date range the SSR snapshot " +
+      "actually covers.",
+    inputSchema: ANY_ARGS,
+  },
+  withValidation(GetStatsArgsSchema, getStats),
 );
 
-server.tool(
+server.registerTool(
   "get_featurebase_stalled_promises",
-  "Find posts where an admin (team) replied in a comment and the customer " +
-    "spoke last, and the admin has been silent for at least " +
-    "minDaysSinceAdminReply days (default 7). Returns each stalled post's " +
-    "slug, title, status, daysSinceAdminReply, and 200-char excerpts of " +
-    "both the last admin message and the last customer message. Sorted " +
-    "by customerLastReplyDate desc (most recent first). Use this to find " +
-    "follow-ups you promised in comments but never came back to. " +
-    "If you don't have admin user IDs configured, ask the user for their " +
-    "name, call find_featurebase_user to look up the IDs, then pass them " +
-    "via teamUserIds.",
-  GetStalledPromisesArgsSchema,
-  getStalledPromises,
+  {
+    description:
+      "Find posts where an admin (team) replied in a comment and the " +
+      "customer spoke last, and the admin has been silent for at least " +
+      "minDaysSinceAdminReply days (default 7). Returns each stalled " +
+      "post's slug, title, status, daysSinceAdminReply, and 200-char " +
+      "excerpts of both the last admin message and the last customer " +
+      "message. Optional status[] restricts candidates; optional sortBy " +
+      "changes ordering. If you don't have admin user IDs configured, " +
+      "ask the user for their name, call find_featurebase_user to look " +
+      "up the IDs, then pass them via teamUserIds.",
+    inputSchema: ANY_ARGS,
+  },
+  withValidation(GetStalledPromisesArgsSchema, getStalledPromises),
 );
 
-server.tool(
+server.registerTool(
   "find_featurebase_user",
-  "Look up Featurebase user IDs by partial name match. Scans post authors " +
-    "from the listing plus the comment threads of the N most recent posts " +
-    "with comments (sampleSize, default 5). Returns matching users with " +
-    "postCount, commentCount, and a guessedRole ('admin' if the user " +
-    "never posts but does comment, 'customer' otherwise). Use the returned " +
-    "userIds as teamUserIds in get_featurebase_stalled_promises — lets the " +
-    "agent run a stalled-promise query without setting FEATUREBASE_TEAM_USER_IDS " +
-    "in the env.",
-  FindUserArgsSchema,
-  findUser,
+  {
+    description:
+      "Look up Featurebase user IDs by partial name match (min 2 " +
+      "chars). Scans post authors from the listing plus the comment " +
+      "threads of the N most recent posts with comments. Returns " +
+      "matching users with postCount, commentCountInSampledPosts, " +
+      "totalCommentCount, and guessedRole. Sort: admin first, then by " +
+      "totalCommentCount desc.",
+    inputSchema: ANY_ARGS,
+  },
+  withValidation(FindUserArgsSchema, findUser),
 );
 
 // ---------------------------------------------------------------------------

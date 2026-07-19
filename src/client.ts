@@ -341,9 +341,16 @@ async function getAllPosts(): Promise<ListingPayload> {
   // board-wide per-user comment count (used by find_featurebase_user)
   // AND the engagement-enrichment pass. Engagement CLASSIFICATION only
   // happens when team is configured, but comment COUNTING happens always.
+  //
+  // Bug fix (audit): a previous version conflated "engagement is null"
+  // (because team is unset → we skipped classification) with "fetch
+  // failed". That made every post show `commentFetchFailed: true` when
+  // no team was configured, even though comments loaded fine. We now
+  // track fetch status separately so commentFetchFailed is only set on
+  // actual fetch errors.
   const commentCountByUserId = new Map<string, number>();
   const engagementByPostId = new Map<string, EngagementFields>();
-  const failedPostIds = new Set<string>();
+  const fetchFailedPostIds = new Set<string>();
   const rawWithComments = raw.filter((r) => (r.commentCount ?? 0) > 0);
   if (rawWithComments.length > 0) {
     const fetched = await mapWithConcurrency(
@@ -352,35 +359,41 @@ async function getAllPosts(): Promise<ListingPayload> {
       async (r) => {
         try {
           const comments = await getComments(r.id);
-          const engagement = team.configured
-            ? computeEngagement(comments)
-            : null;
-          return { id: r.id, engagement, comments };
+          return { id: r.id, status: "ok" as const, comments };
         } catch (err) {
           console.error(
             `[featurebase-mcp] comments fetch failed for ${r.slug}:`,
             err,
           );
-          return { id: r.id, engagement: null, comments: [] as NormalizedComment[] };
+          return { id: r.id, status: "fetch_failed" as const, comments: [] as NormalizedComment[] };
         }
       },
     );
-    for (const { id, engagement, comments } of fetched) {
-      if (engagement) engagementByPostId.set(id, engagement);
-      else failedPostIds.add(id);
-      // Build board-wide per-author comment count while comments are
-      // already loaded — used by find_featurebase_user.totalCommentCount.
+    for (const { id, status, comments } of fetched) {
+      // Build board-wide per-author comment count. Comments are
+      // empty array on fetch failure, so this naturally skips failed posts.
       walkComments(comments, (c) => {
         commentCountByUserId.set(
           c.author.userId,
           (commentCountByUserId.get(c.author.userId) ?? 0) + 1,
         );
       });
+      if (status === "fetch_failed") {
+        fetchFailedPostIds.add(id);
+        continue;
+      }
+      // Engagement is only computed when team is configured. When the
+      // team is unset, the post keeps no engagement fields (loud failure).
+      if (team.configured) {
+        engagementByPostId.set(id, computeEngagement(comments));
+      }
     }
     for (const post of normalized) {
-      const eng = engagementByPostId.get(post.id);
-      if (eng) Object.assign(post, eng);
-      else if (failedPostIds.has(post.id)) post.commentFetchFailed = true;
+      if (engagementByPostId.has(post.id)) {
+        Object.assign(post, engagementByPostId.get(post.id));
+      } else if (fetchFailedPostIds.has(post.id)) {
+        post.commentFetchFailed = true;
+      }
     }
   }
 
