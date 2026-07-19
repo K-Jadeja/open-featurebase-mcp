@@ -1,4 +1,4 @@
-# featurebase-mcp
+# open-featurebase-mcp
 
 A reverse-engineered Model Context Protocol (MCP) server for the [itsremalt Featurebase feedback board](https://itsremalt.featurebase.app). Lets Claude Code, Cursor, and any MCP-compatible agent **read** feature requests, comments, and board stats — no API key, no auth, no cookies required.
 
@@ -125,7 +125,8 @@ Scans post authors from the listing (always available) plus the comment threads 
 ## Install
 
 ```bash
-cd D:/Workspace/Github-Projects/featurebase-mcp
+git clone https://github.com/K-Jadeja/open-featurebase-mcp
+cd open-featurebase-mcp
 npm install
 npm run build
 ```
@@ -146,7 +147,7 @@ Add to your project's `.vscode/mcp.json`:
   "servers": {
     "featurebase-mcp": {
       "command": "node",
-      "args": ["D:/Workspace/Github-Projects/featurebase-mcp/dist/index.js"]
+      "args": ["/absolute/path/to/open-featurebase-mcp/dist/index.js"]
     }
   }
 }

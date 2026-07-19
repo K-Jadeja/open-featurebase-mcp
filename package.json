@@ -1,13 +1,13 @@
 {
-  "name": "@k-jadeja/featurebase-mcp",
+  "name": "@k-jadeja/open-featurebase-mcp",
   "version": "1.0.0",
-  "description": "MCP server for the itsremalt Featurebase feedback board (no auth required, reverse-engineered from public board's __NEXT_DATA__)",
+  "description": "Reverse-engineered MCP server for any public Featurebase feedback board — read-only access (list, search, stats, comments, stalled promises) without an API key or Pro plan.",
   "type": "module",
   "exports": {
     ".": "./dist/index.js"
   },
   "bin": {
-    "featurebase-mcp": "./dist/index.js"
+    "open-featurebase-mcp": "./dist/index.js"
   },
   "files": [
     "dist",
