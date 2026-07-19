@@ -280,7 +280,11 @@ console.log("\n=== CASE D: no-team config surfaces loud failure ===\n");
 // CASE E: partial comment-fetch failure does NOT silently
 // misfilter the hasAdminReply list.
 // ============================================================
-console.log("\n=== CASE E: partial-fetch does not silently misfilter ===\n");
+// CASE E: partial-fetch surfaces engagementComplete=false + warning +
+// failedPostSlugs at the response top level — caller can observe the
+// failure even when the affected post is absent from posts[].
+// ============================================================
+console.log("\n=== CASE E: partial-fetch surfaces loudly ===\n");
 {
   const baseMock = buildMockFetcher({
     listingPages: [boardWithComments()],
@@ -314,25 +318,185 @@ console.log("\n=== CASE E: partial-fetch does not silently misfilter ===\n");
         teamUserIds: [FIXTURE_USER_IDS.krAuthor],
       },
     });
+    check("callTool returned cleanly", !result.isError);
     const body = parseText(result);
-    const slugs = body.posts.map((p) => p.slug).sort();
+
     // p2 had a successful kr-comment → must be included.
+    const slugs = body.posts.map((p) => p.slug);
     check(`p2 included (got ${slugs.join(",")})`, slugs.includes("p2"));
-    // p3's fetch failed — it must not silently appear as if it had
-    // no admin reply. Either it is excluded or it is flagged.
-    const p3 = body.posts.find((p) => p.slug === "p3");
-    if (p3) {
+
+    // Top-level engagementComplete must be false.
+    check(
+      "engagementComplete === false at response top level",
+      body.engagementComplete === false,
+      `got: ${body.engagementComplete}`,
+    );
+    check(
+      "failedCommentPostCount === 1",
+      body.failedCommentPostCount === 1,
+      `got: ${body.failedCommentPostCount}`,
+    );
+    check(
+      "failedPostSlugs includes 'p3'",
+      Array.isArray(body.failedPostSlugs) && body.failedPostSlugs.includes("p3"),
+      `got: ${JSON.stringify(body.failedPostSlugs)}`,
+    );
+    check(
+      "response has non-empty warning that mentions the failure",
+      typeof body.warning === "string" &&
+        body.warning.length > 0 &&
+        body.warning.toLowerCase().includes("comment"),
+    );
+    // The failure MUST be observable even if the affected post is
+    // absent from posts[] (which is the case here, since hasAdminReply:true
+    // excludes posts without admin replies and p3 had only customer
+    // comments anyway).
+    check(
+      "caller can observe failure from engagementComplete alone",
+      body.engagementComplete === false && body.failedPostSlugs?.length > 0,
+    );
+  } finally {
+    await mcp.close();
+  }
+}
+
+// ============================================================
+// CASE F: no-team hasAdminReply request throws InvalidParams — never
+// silently manufactures false classifications.
+// ============================================================
+console.log("\n=== CASE F: no-team hasAdminReply throws InvalidParams ===\n");
+{
+  const mock = buildMockFetcher({
+    listingPages: [boardWithComments()],
+    commentPages: standardComments(),
+  });
+  const mcp = await withServer(mock);
+  try {
+    for (const value of [true, false]) {
+      const result = await mcp.callTool({
+        name: "list_featurebase_posts",
+        arguments: {
+          status: "all", sortBy: "date:desc", limit: 50,
+          hasAdminReply: value,
+          // no teamUserIds override
+        },
+      });
       check(
-        "p3 (fetch-failed) is flagged with commentFetchFailed=true",
-        p3.commentFetchFailed === true,
-        `got: ${JSON.stringify(p3)}`,
+        `hasAdminReply=${value} with no team → result.isError=true`,
+        result.isError === true,
       );
-    } else {
+      const errText = (result.content?.[0]?.text ?? "")
+        .replace(/^MCP error -\d+:\s*/, "");
       check(
-        "p3 (fetch-failed) is excluded from hasAdminReply:true result",
-        true,
+        `error mentions team / find_featurebase_user (got: "${errText.slice(0, 80)}…")`,
+        errText.toLowerCase().includes("team") ||
+          errText.toLowerCase().includes("find_featurebase_user"),
+      );
+      check(
+        `error mentions teamUserIds or FEATUREBASE_TEAM_USER_IDS`,
+        errText.includes("teamUserIds") ||
+          errText.includes("FEATUREBASE_TEAM_USER_IDS"),
+      );
+      // The error must NOT return a posts[] array that looks authoritative.
+      // No posts returned when the request was rejected.
+      check(
+        `rejected request did NOT fabricate posts[] (returned as error)`,
+        result.isError,
       );
     }
+  } finally {
+    await mcp.close();
+  }
+}
+
+// ============================================================
+// CASE G: same cached comments, two different team overrides in
+// sequence — each result must reflect its own team, no role leakage
+// from one call to the next.
+// ============================================================
+console.log("\n=== CASE G: cached comments classify per-request ===\n");
+{
+  const board = [
+    postFixture({
+      id: "p1", slug: "p1", title: "P1", commentCount: 1,
+      author: { _id: FIXTURE_USER_IDS.otherUser, name: "Other User" },
+    }),
+  ];
+  const commentPages = {
+    p1: [buildMockComment({
+      id: "c1", userId: "alice-id", name: "Alice",
+      createdAt: "2026-05-01T00:00:00Z",
+    })],
+  };
+  const mock = buildMockFetcher({ listingPages: [board], commentPages });
+  const mcp = await withServer(mock);
+  try {
+    // First call: team = "alice-id". Alice's role should be "admin".
+    const r1 = await mcp.callTool({
+      name: "list_featurebase_posts",
+      arguments: {
+        status: "all", sortBy: "date:desc", limit: 50,
+        hasAdminReply: true,
+        teamUserIds: ["alice-id"],
+      },
+    });
+    check("first call (team=alice) returned cleanly", !r1.isError);
+    const b1 = parseText(r1);
+    check(
+      "first call: p1 has hasAdminReply=true (alice is admin)",
+      b1.posts.some((p) => p.slug === "p1" && p.hasAdminReply === true),
+      JSON.stringify(b1.posts[0]),
+    );
+    // Network state — only one comment fetch should have happened so far.
+    const afterFirst = mock.commentCount();
+    check(
+      `first call made exactly 1 comment fetch (got ${afterFirst})`,
+      afterFirst === 1,
+    );
+
+    // Second call: team = "bob-id" (Alice is NOT in the team). Alice's
+    // role should now be "customer" → hasAdminReply=false.
+    const r2 = await mcp.callTool({
+      name: "list_featurebase_posts",
+      arguments: {
+        status: "all", sortBy: "date:desc", limit: 50,
+        hasAdminReply: true,
+        teamUserIds: ["bob-id"],
+      },
+    });
+    check("second call (team=bob) returned cleanly", !r2.isError);
+    const b2 = parseText(r2);
+    check(
+      "second call: p1 has hasAdminReply=false (alice is customer now)",
+      b2.posts.every((p) => p.slug !== "p1" || p.hasAdminReply === false),
+      JSON.stringify(b2.posts),
+    );
+    // Cache reuse: second call should NOT re-fetch the comments.
+    check(
+      `second call made 0 new comment fetches (got ${mock.commentCount() - afterFirst})`,
+      mock.commentCount() - afterFirst === 0,
+    );
+
+    // Reverse order: third call back to team=alice. Now Alice should
+    // be admin again, proving the cache didn't leak the bob-classification.
+    const r3 = await mcp.callTool({
+      name: "list_featurebase_posts",
+      arguments: {
+        status: "all", sortBy: "date:desc", limit: 50,
+        hasAdminReply: true,
+        teamUserIds: ["alice-id"],
+      },
+    });
+    const b3 = parseText(r3);
+    check(
+      "third call (back to team=alice): hasAdminReply=true restored",
+      b3.posts.some((p) => p.slug === "p1" && p.hasAdminReply === true),
+      JSON.stringify(b3.posts[0]),
+    );
+    check(
+      "third call made 0 new comment fetches (cache fully reused)",
+      mock.commentCount() - afterFirst === 0,
+    );
   } finally {
     await mcp.close();
   }

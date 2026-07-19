@@ -39,6 +39,7 @@ import type {
   NormalizedComment,
   NormalizedPost,
   NormalizedPostDetail,
+  RoleNeutralComment,
 } from "./types.js";
 import { aggregateCommentCounts } from "./aggregation.js";
 import { createFetcher, type Fetcher } from "./fetcher.js";
@@ -332,12 +333,12 @@ function computeEngagementWithTeamOverride(
 // Find last comment by predicate (for team override paths)
 // ---------------------------------------------------------------------------
 
-function findLastCommentWhere(
-  comments: NormalizedComment[],
-  predicate: (c: NormalizedComment) => boolean,
-): NormalizedComment | null {
-  let last: NormalizedComment | null = null;
-  function walk(c: NormalizedComment): void {
+function findLastCommentWhere<T extends { createdAt: string; replies: T[] }>(
+  comments: readonly T[],
+  predicate: (c: T) => boolean,
+): T | null {
+  let last: T | null = null;
+  function walk(c: T): void {
     if (predicate(c)) {
       if (!last || c.createdAt > last.createdAt) last = c;
     }
@@ -347,16 +348,9 @@ function findLastCommentWhere(
   return last;
 }
 
-function findLastCommentByRole(
-  comments: NormalizedComment[],
-  role: CommentRole,
-): NormalizedComment | null {
-  return findLastCommentWhere(comments, (c) => c.author.role === role);
-}
-
 function walkComments(
-  comments: NormalizedComment[],
-  fn: (c: NormalizedComment) => void,
+  comments: RoleNeutralComment[],
+  fn: (c: RoleNeutralComment) => void,
 ): void {
   for (const c of comments) {
     fn(c);
@@ -364,18 +358,33 @@ function walkComments(
   }
 }
 
+/**
+ * Build a fresh role-tagged tree from a role-neutral cache hit.
+ *
+ * The cached tree (from `getComments`) has no derived `role` on any
+ * author — only identity (userId, name, picture). For each request we
+ * rebuild a new tree with `role` assigned against THIS request's team
+ * set. The cached tree is never mutated, so two requests with different
+ * `teamUserIds` overrides see independent classifications.
+ */
 function reclassifyTree(
-  comments: NormalizedComment[],
+  comments: RoleNeutralComment[],
   team: ReadonlySet<string>,
   configured: boolean,
 ): NormalizedComment[] {
   return comments.map((c) => ({
-    ...c,
+    id: c.id,
     author: enrichAuthor(
       { name: c.author.name, picture: c.author.picture, userId: c.author.userId },
       team,
       configured,
     ),
+    bodyHtml: c.bodyHtml,
+    bodyText: c.bodyText,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    upvotes: c.upvotes,
+    parentId: c.parentId,
     replies: reclassifyTree(c.replies, team, configured),
   }));
 }
@@ -476,15 +485,48 @@ async function fetchCommentsPage(
   }
 }
 
+/**
+ * Normalize a comment WITHOUT a team set. The cached tree is role-neutral
+ * — see RoleNeutralComment in types.ts. Roles are assigned per request
+ * via `reclassifyTree(tree, effectiveTeam)`, never stored.
+ */
+function normalizeCommentNeutral(raw: any): RoleNeutralComment {
+  return {
+    id: raw.id,
+    author: {
+      name: raw?.user?.name ?? "Anonymous",
+      picture: raw?.user?.picture,
+      userId: raw?.user?._id ?? raw?.createdBy ?? "",
+    },
+    bodyHtml: raw.content ?? "",
+    bodyText: htmlToText(raw.content ?? ""),
+    createdAt: raw.createdAt ?? "",
+    updatedAt: raw.updatedAt ?? "",
+    upvotes: raw.upvotes ?? 0,
+    parentId: raw.parentComment ?? null,
+    replies: Array.isArray(raw.replies)
+      ? raw.replies.map((r: any) => normalizeCommentNeutral(r))
+      : [],
+  };
+}
+
+/**
+ * Fetch a submission's comment thread and cache it in role-neutral form.
+ * The returned tree has no derived `role` on any author; callers must
+ * classify with `reclassifyTree(tree, effectiveTeam)` against the team
+ * set active for the specific request. This guarantees two consecutive
+ * requests with different `teamUserIds` overrides cannot contaminate
+ * each other's classification — the cache holds only identity + body,
+ * never a derived role.
+ */
 async function getComments(
   fetcher: Fetcher,
   cache: ReturnType<typeof makeCache>,
   submissionId: string,
-  team: ReadonlySet<string>,
-): Promise<NormalizedComment[]> {
+): Promise<RoleNeutralComment[]> {
   if (!submissionId) return [];
   const cacheKey = `comments:${submissionId}`;
-  const cached = cache.get<NormalizedComment[]>(cacheKey);
+  const cached = cache.get<RoleNeutralComment[]>(cacheKey);
   if (cached) return cached;
 
   const first = await fetchCommentsPage(fetcher, submissionId, 1);
@@ -501,8 +543,10 @@ async function getComments(
       .flatMap((r) => r.value.results),
   ];
 
-  const tree = allRaw.map((r) => normalizeComment(r, team));
-  function sortReplies(node: NormalizedComment): void {
+  const tree: RoleNeutralComment[] = allRaw.map((r) =>
+    normalizeCommentNeutral(r),
+  );
+  function sortReplies(node: RoleNeutralComment): void {
     node.replies.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     for (const r of node.replies) sortReplies(r);
   }
@@ -727,7 +771,7 @@ export function createClient(opts: ClientOptions = {}): Client {
         COMMENTS_CONCURRENCY,
         async (p) => {
           try {
-            const comments = await getComments(fetcher, cache, p.id, team);
+            const comments = await getComments(fetcher, cache, p.id);
             return { id: p.id, ok: true as const, comments };
           } catch (err) {
             console.error(
@@ -805,10 +849,15 @@ export function createClient(opts: ClientOptions = {}): Client {
         ? new Set(teamUserIds)
         : null;
     try {
-      const comments = await getComments(fetcher, cache, post.id, team);
+      const neutral = await getComments(fetcher, cache, post.id);
+      const classified = reclassifyTree(
+        neutral,
+        teamOverride ?? team,
+        teamOverride !== null,
+      );
       const eng = teamOverride
-        ? computeEngagementWithTeamOverride(comments, teamOverride)
-        : computeEngagement(comments);
+        ? computeEngagementWithTeamOverride(classified, teamOverride)
+        : computeEngagement(classified);
       return { ...post, ...eng };
     } catch {
       return { ...post, commentFetchFailed: true };
@@ -828,6 +877,9 @@ export function createClient(opts: ClientOptions = {}): Client {
       // hasAdminReply requires per-post engagement fields, which means
       // we have to fetch comments for posts that have any. Lazy: only
       // triggered when the caller actually asks for the filter.
+      let engagementComplete = true;
+      const failedPostSlugs: string[] = [];
+      let engagementWarning: string | undefined;
       if (args.hasAdminReply !== undefined) {
         // The caller may pass teamUserIds as an override (useful for
         // tests and for the find_featurebase_user → list_featurebase_posts
@@ -837,73 +889,118 @@ export function createClient(opts: ClientOptions = {}): Client {
             ? new Set(args.teamUserIds)
             : null;
         const effectiveTeam = teamOverride ?? team;
-        const effectiveHasTeam = effectiveTeam.size > 0;
-        if (!effectiveHasTeam) {
-          // Without a team set, role classification is impossible.
-          // Per the audit: silent classification would be worse than
-          // returning empty + a clear warning. Surface it via a
-          // synthetic warning field attached to each returned post.
-          const warning =
-            "hasAdminReply filter requires FEATUREBASE_TEAM_USER_IDS " +
-            "or a teamUserIds override. Set the env var, or call " +
-            "find_featurebase_user to discover your user IDs.";
-          posts = posts.map((p) =>
-            p.commentCount > 0
-              ? { ...p, hasAdminReply: false, hasAdminReplyWarning: warning }
-              : { ...p, hasAdminReply: false, hasAdminReplyWarning: warning },
+        if (effectiveTeam.size === 0) {
+          // Loud failure: we cannot classify engagement without a team
+          // set. Fabricating hasAdminReply:false would be a silent
+          // false-negative for hasAdminReply:true callers (returns
+          // empty) AND a silent false-positive for hasAdminReply:false
+          // callers (returns every post). Neither is acceptable. Throw
+          // so the MCP transport surfaces a clean InvalidParams error
+          // and the agent can correct the request.
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "hasAdminReply requires a team set. Either set " +
+              "FEATUREBASE_TEAM_USER_IDS or pass teamUserIds — " +
+              "call find_featurebase_user with your name to discover " +
+              "your user IDs first.",
           );
-        } else {
-          const withComments = posts.filter(
-            (p) => p.commentCount > 0 && !p.commentFetchFailed,
-          );
-          const enriched = await mapWithConcurrency(
-            withComments,
-            COMMENTS_CONCURRENCY,
-            async (p) => {
-              try {
-                const comments = await getComments(
-                  fetcher,
-                  cache,
-                  p.id,
-                  effectiveTeam,
-                );
-                const eng = teamOverride
-                  ? computeEngagementWithTeamOverride(comments, teamOverride)
-                  : computeEngagement(comments);
-                return { id: p.id, eng };
-              } catch {
-                return { id: p.id, eng: undefined };
-              }
-            },
-          );
-          const engById = new Map<string, EngagementFields | undefined>();
-          for (const e of enriched) engById.set(e.id, e.eng);
-
-          posts = posts.map((p) => {
-            const eng = engById.get(p.id);
-            if (eng === undefined) {
-              return p.commentCount > 0
-                ? { ...p, commentFetchFailed: true }
-                : p;
-            }
-            return { ...p, ...eng };
-          });
         }
+        const withComments = posts.filter(
+          (p) => p.commentCount > 0 && !p.commentFetchFailed,
+        );
+        const enriched = await mapWithConcurrency(
+          withComments,
+          COMMENTS_CONCURRENCY,
+          async (p) => {
+            try {
+              const neutral = await getComments(fetcher, cache, p.id);
+              const classified = reclassifyTree(
+                neutral,
+                effectiveTeam,
+                true,
+              );
+              const eng = teamOverride
+                ? computeEngagementWithTeamOverride(classified, teamOverride)
+                : computeEngagement(classified);
+              return { id: p.id, slug: p.slug, ok: true as const, eng };
+            } catch (err) {
+              console.error(
+                `[featurebase-mcp] list-posts: comments fetch failed for ${p.slug}:`,
+                err,
+              );
+              return {
+                id: p.id,
+                slug: p.slug,
+                ok: false as const,
+              };
+            }
+          },
+        );
+        const engById = new Map<
+          string,
+          { ok: true; eng: EngagementFields } | { ok: false }
+        >();
+        for (const e of enriched) {
+          if (e.ok) engById.set(e.id, { ok: true, eng: e.eng });
+          else {
+            engById.set(e.id, { ok: false });
+            failedPostSlugs.push(e.slug);
+            engagementComplete = false;
+          }
+        }
+
+        posts = posts.map((p) => {
+          const result = engById.get(p.id);
+          if (result === undefined) return p; // no comments to fetch
+          if (!result.ok) {
+            return { ...p, commentFetchFailed: true };
+          }
+          return { ...p, ...result.eng };
+        });
 
         posts = posts.filter(
           (p) => (p.hasAdminReply ?? null) === args.hasAdminReply,
         );
+
+        if (!engagementComplete) {
+          engagementWarning =
+            `hasAdminReply filter is incomplete — comment fetch failed for ` +
+            `${failedPostSlugs.length} post(s) (${failedPostSlugs.slice(0, 5).join(", ")}` +
+            (failedPostSlugs.length > 5 ? ", …" : "") +
+            `). Their hasAdminReply value is reported as commentFetchFailed=true ` +
+            `and they may have been excluded from posts[]. Re-run after a few minutes ` +
+            `to retry, or remove them from the board and call again.`;
+        }
       }
 
       posts = sortPosts(posts, args.sortBy).slice(0, args.limit);
 
-      return {
+      const response: {
+        totalResults: number;
+        availableResults: number;
+        truncated: boolean;
+        returned: number;
+        posts: typeof posts;
+        engagementComplete?: boolean;
+        failedCommentPostCount?: number;
+        failedPostSlugs?: string[];
+        warning?: string;
+      } = {
         totalResults: all.totalResults,
         availableResults: all.availableResults,
         truncated: all.availableResults < all.totalResults,
         returned: posts.length,
         posts,
       };
+      if (args.hasAdminReply !== undefined) {
+        response.engagementComplete = engagementComplete;
+        if (failedPostSlugs.length > 0) {
+          response.failedCommentPostCount = failedPostSlugs.length;
+          response.failedPostSlugs = failedPostSlugs;
+        }
+        if (engagementWarning) response.warning = engagementWarning;
+      }
+      return response;
     },
 
     async getPost(
@@ -932,10 +1029,15 @@ export function createClient(opts: ClientOptions = {}): Client {
       let comments: NormalizedComment[] | undefined;
       let commentsError: string | undefined;
       try {
-        const rawComments = await getComments(fetcher, cache, post.id, team);
-        comments = teamUserIds
-          ? reclassifyTree(rawComments, new Set(teamUserIds), true)
-          : rawComments;
+        // getComments always returns a role-neutral cached tree.
+        // Reclassify it against THIS request's effective team so the
+        // returned comments reflect the team set the caller asked for,
+        // not whatever team was active when the cache was last warmed.
+        const neutral = await getComments(fetcher, cache, post.id);
+        const effectiveTeamReclass = teamUserIds
+          ? new Set(teamUserIds)
+          : team;
+        comments = reclassifyTree(neutral, effectiveTeamReclass, true);
       } catch (err) {
         commentsError = err instanceof Error ? err.message : String(err);
         console.error(
@@ -1125,10 +1227,15 @@ export function createClient(opts: ClientOptions = {}): Client {
             // We need per-post dates, so fetch the post's comments.
             if (p.commentCount === 0) return { p, eng: undefined };
             try {
-              const comments = await getComments(fetcher, cache, p.id, team);
+              const neutral = await getComments(fetcher, cache, p.id);
+              const classified = reclassifyTree(
+                neutral,
+                teamOverride ?? team,
+                true,
+              );
               const eng = teamOverride
-                ? computeEngagementWithTeamOverride(comments, teamOverride)
-                : computeEngagement(comments);
+                ? computeEngagementWithTeamOverride(classified, teamOverride)
+                : computeEngagement(classified);
               return { p, eng };
             } catch {
               return { p, eng: undefined };
@@ -1181,16 +1288,21 @@ export function createClient(opts: ClientOptions = {}): Client {
         let lastAdminMsg: StalledPromise["lastAdminMessage"] = null;
         let lastCustomerMsg: StalledPromise["lastCustomerMessage"] = null;
         try {
-          const comments = await getComments(fetcher, cache, p.id, team);
+          const neutral = await getComments(fetcher, cache, p.id);
+          const classified = reclassifyTree(
+            neutral,
+            teamOverride ?? team,
+            true,
+          );
           const adminPredicate = teamOverride
             ? (c: NormalizedComment) => teamOverride.has(c.author.userId)
             : (c: NormalizedComment) => c.author.role === "admin";
           const customerPredicate = teamOverride
             ? (c: NormalizedComment) => !teamOverride.has(c.author.userId)
             : (c: NormalizedComment) => c.author.role === "customer";
-          const lastAdmin = findLastCommentWhere(comments, adminPredicate);
+          const lastAdmin = findLastCommentWhere(classified, adminPredicate);
           const lastCustomer = findLastCommentWhere(
-            comments,
+            classified,
             customerPredicate,
           );
           if (lastAdmin) {
@@ -1263,7 +1375,7 @@ export function createClient(opts: ClientOptions = {}): Client {
         // Walk every with-comments post's cached comments to identify matched IDs.
         for (const p of all.normalized.filter((x) => x.commentCount > 0)) {
           try {
-            const cs = await getComments(fetcher, cache, p.id, team);
+            const cs = await getComments(fetcher, cache, p.id);
             walkComments(cs, (c) => {
               if (teamOverride.has(c.author.userId))
                 allMatched.add(c.author.userId);
@@ -1340,7 +1452,7 @@ export function createClient(opts: ClientOptions = {}): Client {
 
       for (const p of samplePosts) {
         try {
-          const comments = await getComments(fetcher, cache, p.id, team);
+          const comments = await getComments(fetcher, cache, p.id);
           walkComments(comments, (c) => {
             if (!c.author.name.toLowerCase().includes(lower)) return;
             const existing = matches.get(c.author.userId);

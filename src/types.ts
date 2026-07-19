@@ -106,6 +106,36 @@ export interface NormalizedComment {
   replies: NormalizedComment[];
 }
 
+/**
+ * Role-neutral comment tree — exactly the shape the in-memory cache holds.
+ *
+ * This is what `getComments()` returns from the cache and what is reused
+ * across requests. The cached tree must NOT carry a derived `role` field,
+ * because `role` depends on the team set active at *call time*, not at
+ * fetch time. Storing role on the cached tree would let a request using
+ * `teamUserIds` override pollute the cache for a later request that uses
+ * the default team.
+ *
+ * To produce a `NormalizedComment[]` with roles for a specific call,
+ * pass the cached tree through `reclassifyTree(tree, effectiveTeam)`
+ * — which builds a fresh role-bearing tree without mutating the cached one.
+ */
+export interface RoleNeutralComment {
+  id: string;
+  author: {
+    name: string;
+    picture?: string;
+    userId: string;
+  };
+  bodyHtml: string;
+  bodyText: string;
+  createdAt: string;
+  updatedAt: string;
+  upvotes: number;
+  parentId: string | null;
+  replies: RoleNeutralComment[];
+}
+
 export interface NormalizedPostDetail extends NormalizedPost {
   contentHtml: string;
   contentText: string;

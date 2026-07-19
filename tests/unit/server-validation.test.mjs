@@ -178,19 +178,76 @@ console.log("=== Direct validateToolInput: bad args per tool ===\n");
   );
 }
 
-// 3g. Don't echo the bad value (defense against secret leaks)
+// 3g. Don't echo the bad value (defense against secret leaks).
+//
+// The previous version passed a valid `name` value and asserted no
+// echo — vacuous, since the validation succeeded and no error message
+// was generated. This version uses a slot that DOES trigger a
+// validation error (sortBy enum with a secret-looking value), and
+// asserts the value is not in the error message.
+//
+// Zod's `invalid_enum_value` issue includes the offending value in its
+// default message ("Invalid enum value. Expected 'a' | 'b', received 'X'"),
+// so a sloppy formatter would echo it. Our formatter must NOT.
 {
-  const tool = toolsByName["find_featurebase_user"];
-  const secret = "sk-live-THIS-COULD-BE-A-SECRET";
+  const tool = toolsByName["get_featurebase_stalled_promises"];
+  const secret = "sk-live-THIS-COULD-BE-A-SECRET-1234567890";
   let thrown;
   try {
-    await server.validateToolInput(tool, { name: secret }, "find_featurebase_user");
-  } catch (e) { thrown = e; }
+    await server.validateToolInput(
+      tool,
+      { sortBy: secret }, // enum mismatch — Zod's default echoes the value
+      "get_featurebase_stalled_promises",
+    );
+  } catch (e) {
+    thrown = e;
+  }
+  check(
+    "validation REJECTED the secret value (precondition for echo test)",
+    thrown instanceof McpError,
+    `thrown: ${thrown}`,
+  );
   const cleanMsg = (thrown?.message ?? "").replace(/^MCP error -\d+:\s*/, "");
   check(
-    "no echo of input value in clean message",
+    `no echo of secret value in error message (msg: "${cleanMsg}")`,
     !cleanMsg.includes(secret),
-    `msg: ${cleanMsg}`,
+  );
+  check(
+    "no echo of arbitrary 'sk-live-' prefix",
+    !cleanMsg.includes("sk-live-"),
+  );
+  check(
+    "no echo of arbitrary input that includes 'secret' substring",
+    !/secret/i.test(cleanMsg),
+  );
+}
+
+// 3h. formatZodIssue direct test — synthetic issue with a secret-shaped
+// payload must produce a clean message that does NOT echo it. This is
+// the unit-level proof that the formatter itself does not leak values,
+// independent of any schema behavior.
+{
+  const { formatZodIssue } = await import("../../dist/validation.js");
+  const secret = "AKIA-FakeAWSKey-AAAABBBBCCCCDDDD";
+  const syntheticIssue = {
+    code: "invalid_enum_value",
+    expected: ["a", "b"],
+    received: secret,
+    path: ["apiKey"],
+    message: `Invalid enum value. Expected 'a' | 'b', received '${secret}'`,
+  };
+  const formatted = formatZodIssue(syntheticIssue);
+  check(
+    `formatZodIssue produces clean message: "${formatted}"`,
+    formatted.startsWith("apiKey:") &&
+      formatted.includes("a") &&
+      formatted.includes("b") &&
+      !formatted.includes(secret),
+  );
+  check(
+    "formatZodIssue does NOT echo the offending secret value",
+    !formatted.includes(secret),
+    `formatted: ${formatted}`,
   );
 }
 
