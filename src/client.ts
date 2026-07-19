@@ -1126,8 +1126,25 @@ export function createClient(opts: ClientOptions = {}): Client {
         }
 
         posts = posts.map((p) => {
+          // Zero-comment posts must carry EXPLICIT zero engagement so
+          // the strict-equality filter `(p.hasAdminReply ?? null) ===
+          // args.hasAdminReply` below matches them correctly. Without
+          // this, hasAdminReply stays undefined and `undefined ?? null`
+          // equals `null`, never `false` — silently excluding every
+          // zero-comment post from hasAdminReply:false (and silently
+          // matching them against hasAdminReply:true, since `undefined
+          // !== true` is also true). A zero-comment post DEFINITIVELY
+          // satisfies "the team has not commented".
+          if (p.commentCount === 0) {
+            return {
+              ...p,
+              hasAdminReply: false,
+              adminReplyCount: 0,
+              customerCommentCount: 0,
+            };
+          }
           const result = engById.get(p.id);
-          if (result === undefined) return p; // no comments to fetch
+          if (result === undefined) return p;
           if (!result.ok) {
             return { ...p, commentFetchFailed: true };
           }
@@ -1246,15 +1263,29 @@ export function createClient(opts: ClientOptions = {}): Client {
       // include_comments=true — single fetch.
       if (post.commentCount === 0) {
         // No comments on this post: skip the fetch entirely, return
-        // the post with empty comments[]. Still reclassify the post
-        // author against the per-call team.
-        const enrichedWithAuthor = reclassifyPostAuthor(
+        // the post with empty comments[]. When a team is configured,
+        // populate explicit zero engagement values so callers can
+        // distinguish "no comments yet" from "unclassified". When no
+        // team is configured, keep the loud-unknown contract: omit
+        // engagement fields and let authors stay as role="unknown".
+        const withAuthor = reclassifyPostAuthor(
           post,
           effectiveTeam,
           teamConfigured,
         );
+        if (teamConfigured) {
+          return {
+            ...withAuthor,
+            contentHtml,
+            contentText,
+            comments: [],
+            hasAdminReply: false,
+            adminReplyCount: 0,
+            customerCommentCount: 0,
+          };
+        }
         return {
-          ...enrichedWithAuthor,
+          ...withAuthor,
           contentHtml,
           contentText,
           comments: [],

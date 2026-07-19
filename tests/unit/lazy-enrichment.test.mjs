@@ -183,6 +183,11 @@ console.log("\n=== CASE B: hasAdminReply:true triggers enrichment ===\n");
       slugs.length === 2 && slugs.includes("p2") && slugs.includes("p4"),
     );
     check(
+      "zero-comment p1 is correctly EXCLUDED from hasAdminReply:true (hasAdminReply=false !== true)",
+      !slugs.includes("p1"),
+      `got: ${slugs.join(",")}`,
+    );
+    check(
       `comment fetches happened (got ${mock.commentCount()})`,
       mock.commentCount() >= 2,
     );
@@ -196,9 +201,12 @@ console.log("\n=== CASE B: hasAdminReply:true triggers enrichment ===\n");
 }
 
 // ============================================================
-// CASE C: hasAdminReply:false filters correctly
+// CASE C: hasAdminReply:false filters correctly.
+// Includes the zero-comment post (p1) as a definitive hasAdminReply:false
+// match — a post with no comments DEFINITIVELY satisfies "the team has
+// not commented".
 // ============================================================
-console.log("\n=== CASE C: hasAdminReply:false filters correctly ===\n");
+console.log("\n=== CASE C: hasAdminReply:false includes zero-comment posts ===\n");
 {
   const mock = buildMockFetcher({
     listingPages: [boardWithComments()],
@@ -217,12 +225,56 @@ console.log("\n=== CASE C: hasAdminReply:false filters correctly ===\n");
     const body = parseText(result);
     const slugs = body.posts.map((p) => p.slug).sort();
     check(
-      `hasAdminReply:false returned p3 only (got ${slugs.join(",")})`,
-      slugs.length === 1 && slugs[0] === "p3",
+      `hasAdminReply:false returned p1+p3 (zero-comment p1 + customer-only p3) (got ${slugs.join(",")})`,
+      slugs.length === 2 && slugs.includes("p1") && slugs.includes("p3"),
+      `got: ${slugs.join(",")}`,
     );
     check(
       "no false-positives: no returned post has hasAdminReply=true",
       body.posts.every((p) => p.hasAdminReply === false),
+    );
+    // Zero-comment post carries explicit engagement values so the
+    // strict-equality filter matches correctly.
+    const p1 = body.posts.find((p) => p.slug === "p1");
+    check(
+      "p1 (zero comments) has hasAdminReply === false (explicit, not undefined)",
+      p1?.hasAdminReply === false,
+      `got: ${p1?.hasAdminReply}`,
+    );
+    check(
+      "p1 (zero comments) has adminReplyCount === 0",
+      p1?.adminReplyCount === 0,
+      `got: ${p1?.adminReplyCount}`,
+    );
+    check(
+      "p1 (zero comments) has customerCommentCount === 0",
+      p1?.customerCommentCount === 0,
+      `got: ${p1?.customerCommentCount}`,
+    );
+    // Admin/customer last-reply dates remain ABSENT (no comments to date).
+    check(
+      "p1 (zero comments) has adminLastReplyDate absent",
+      p1?.adminLastReplyDate === undefined,
+      `got: ${p1?.adminLastReplyDate}`,
+    );
+    check(
+      "p1 (zero comments) has customerLastReplyDate absent",
+      p1?.customerLastReplyDate === undefined,
+      `got: ${p1?.customerLastReplyDate}`,
+    );
+    // p1 itself caused zero comment fetches (no API request needed
+    // for a zero-comment post). The mock counter is total comment
+    // fetches across the whole test, so we cannot assert the global
+    // counter is zero — p2 and p3 do require fetches. Instead, verify
+    // by URL inspection that no fetch URL mentions p1.
+    const calls = mock.calls ?? [];
+    const p1Fetched = calls.some(
+      (u) => typeof u === "string" && u.includes("submissionId=p1"),
+    );
+    check(
+      "zero-comment p1 was never fetched (no submissionId=p1 in calls)",
+      !p1Fetched,
+      `calls mentioning p1: ${calls.filter((u) => typeof u === "string" && u.includes("submissionId=p1")).length}`,
     );
   } finally {
     await mcp.close();
