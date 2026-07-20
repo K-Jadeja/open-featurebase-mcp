@@ -46,6 +46,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { createRequire } from "node:module";
 import { z } from "zod";
 
 import { formatZodIssue } from "./validation.js";
@@ -53,7 +54,13 @@ import { createClient, type Client } from "./client.js";
 // Single source of truth for the server's reported version. Read from
 // package.json at module load so the MCP handshake advertises whatever
 // version is published to npm — no manual string sync on release.
-import packageJson from "../package.json" with { type: "json" };
+//
+// Note: JSON import attributes (`import ... with { type: "json" }`)
+// require Node 18.20+ / 20.10+. The package's engines.node range is
+// >=18.17, so we use createRequire(import.meta.url) + require() for
+// compatibility with the entire 18.17+ range.
+const require = createRequire(import.meta.url);
+const packageJson = require("../package.json") as { version: string };
 import { ListPostsArgsSchema } from "./tools/list-posts.js";
 import { createListPostsHandler } from "./tools/list-posts.js";
 import { GetPostArgsSchema } from "./tools/get-post.js";

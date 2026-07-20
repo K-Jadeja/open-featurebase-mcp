@@ -1,18 +1,16 @@
 {
   "name": "@kjadeja/open-featurebase-mcp",
-  "version": "1.0.1",
-  "description": "Reverse-engineered MCP server for any public Featurebase feedback board — read-only access (list, search, stats, comments, stalled promises) without an API key or Pro plan.",
+  "version": "1.0.2",
+  "description": "Read-only MCP server for public Featurebase boards exposing the standard public listing and comment endpoints.",
   "type": "module",
-  "exports": {
-    ".": "./dist/index.js"
-  },
   "bin": {
     "open-featurebase-mcp": "./dist/index.js"
   },
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "package.json"
   ],
   "scripts": {
     "build": "tsc",
@@ -20,8 +18,10 @@
     "start": "node dist/index.js",
     "clean": "node scripts/clean.mjs",
     "pretest": "npm run build",
-    "test": "node tests/unit/aggregation.test.mjs && node tests/unit/validation-format.test.mjs && node tests/unit/server-construction.test.mjs && node tests/unit/sdk-version.test.mjs && node tests/unit/client-cold-cache.test.mjs && node tests/unit/client-partial-fetch.test.mjs && node tests/unit/inspect-schemas.test.mjs && node tests/unit/server-validation.test.mjs && node tests/unit/server-cache-isolation.test.mjs && node tests/unit/lazy-enrichment.test.mjs && node tests/unit/role-classification.test.mjs && node tests/unit/atomic-pagination.test.mjs && node tests/unit/same-client-recovery.test.mjs && node tests/unit/zero-comment-enrichment.test.mjs",
-    "test:live": "node scripts/with-env.mjs --live node tests/live/real-mcp.test.mjs"
+    "test": "node tests/unit/aggregation.test.mjs && node tests/unit/validation-format.test.mjs && node tests/unit/server-construction.test.mjs && node tests/unit/sdk-version.test.mjs && node tests/unit/client-cold-cache.test.mjs && node tests/unit/client-partial-fetch.test.mjs && node tests/unit/inspect-schemas.test.mjs && node tests/unit/server-validation.test.mjs && node tests/unit/server-cache-isolation.test.mjs && node tests/unit/lazy-enrichment.test.mjs && node tests/unit/role-classification.test.mjs && node tests/unit/atomic-pagination.test.mjs && node tests/unit/same-client-recovery.test.mjs && node tests/unit/zero-comment-enrichment.test.mjs && node tests/unit/server-version.test.mjs",
+    "test:live": "node scripts/with-env.mjs --live node tests/live/real-mcp.test.mjs",
+    "prepack": "npm run clean && npm run build",
+    "prepublishOnly": "npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

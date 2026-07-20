@@ -163,7 +163,7 @@ This uses `list_featurebase_posts(status="open", sortBy="date:desc", limit=20)` 
 
 ### Find unanswered posts
 
-> List all open posts in the In Progress category with zero admin replies. These are the ones we should respond to first.
+> List all open posts with the `in_progress` status that have zero admin replies. These are the ones we should respond to first.
 
 This is `list_featurebase_posts(hasAdminReply=false, status="in_progress")`.
 
@@ -181,7 +181,17 @@ Seven read-only tools. Each one is designed to be cheap enough to chain — most
 
 **Args:**
 
-- `status` — one of: `all` (default), `open`, `in_review`, `planned`, `in_progress`, `completed`. **Note:** the underlying `postStatus.type` for "In Progress" is `reviewing`; for "Planned" it's `unstarted`. The friendly names above are what you pass in.
+- `status` — one of the friendly names below; the server maps them to the underlying `postStatus.type` values returned by the public board:
+
+  | Friendly name | `postStatus.type` |
+  |---|---|
+  | `open` | `open` |
+  | `in_review` | `reviewing` |
+  | `planned` | `unstarted` |
+  | `in_progress` | `active` |
+  | `completed` | `completed` |
+
+  The default `all` skips the filter and returns every status.
 - `sortBy` — `date:desc` (default), `date:asc`, or `upvotes:desc`.
 - `limit` — 1–200, default 50.
 - `hasAdminReply` — optional boolean. **Requires** a team identity (env var or `teamUserIds` override). If neither is set, the call throws `InvalidParams`.
