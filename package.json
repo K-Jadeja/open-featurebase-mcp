@@ -1,5 +1,5 @@
 {
-  "name": "@k-jadeja/open-featurebase-mcp",
+  "name": "@kjadeja/open-featurebase-mcp",
   "version": "1.0.0",
   "description": "Reverse-engineered MCP server for any public Featurebase feedback board — read-only access (list, search, stats, comments, stalled promises) without an API key or Pro plan.",
   "type": "module",
@@ -11,7 +11,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
@@ -28,7 +29,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "tsx": "^4.0.0",
+    "tsx": "^4.3.0",
     "typescript": "^5.3.0"
   },
   "engines": {
@@ -37,9 +38,24 @@
   "keywords": [
     "mcp",
     "featurebase",
+    "feedback-board",
+    "model-context-protocol",
     "itsremalt",
-    "model-context-protocol"
+    "stalled-promises",
+    "comments",
+    "read-only"
   ],
   "author": "K-Jadeja",
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/K-Jadeja/open-featurebase-mcp.git"
+  },
+  "homepage": "https://github.com/K-Jadeja/open-featurebase-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/K-Jadeja/open-featurebase-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }
