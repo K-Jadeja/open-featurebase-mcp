@@ -242,9 +242,14 @@ console.log("\n=== Scenario 3: get_post zero-comment, team configured, include_c
 // ============================================================
 // SCENARIO 4: get_post on a zero-comment post with team configured.
 // include_comments=false:
-//   - returns the post without engagement fields (lazy path; the
-//     post had commentCount=0 so enrichPostEngagement returns the
-//     post unchanged — that's correct: no comments to enrich).
+//   - returns the post without comments[]
+//   - explicit zero engagement values (same as include_comments=true)
+//   - zero comment fetches
+// include_comments controls only whether comments[] is included. It
+// must not change already-known engagement metadata. A zero-comment
+// post with a configured team definitively satisfies "the team has
+// not commented" — populate the zero engagement values via the
+// shared helper regardless of include_comments.
 // ============================================================
 console.log("\n=== Scenario 4: get_post zero-comment, team configured, include_comments=false ===\n");
 {
@@ -280,13 +285,84 @@ console.log("\n=== Scenario 4: get_post zero-comment, team configured, include_c
       body.author?.role === "customer",
       `got: ${body.author?.role}`,
     );
-    // enrichPostEngagement short-circuits when commentCount===0, so
-    // the post comes back without engagement fields. This is the
-    // existing include_comments=false contract.
+    // The shared zero-comment helper must produce the same engagement
+    // values regardless of include_comments.
     check(
-      "engagement fields absent in include_comments=false path (lazy)",
-      body.hasAdminReply === undefined,
+      "hasAdminReply === false (explicit zero engagement, parity with include_comments=true)",
+      body.hasAdminReply === false,
       `got: ${body.hasAdminReply}`,
+    );
+    check(
+      "adminReplyCount === 0 (parity with include_comments=true)",
+      body.adminReplyCount === 0,
+      `got: ${body.adminReplyCount}`,
+    );
+    check(
+      "customerCommentCount === 0 (parity with include_comments=true)",
+      body.customerCommentCount === 0,
+      `got: ${body.customerCommentCount}`,
+    );
+    check(
+      "adminLastReplyDate absent (no comments to date)",
+      body.adminLastReplyDate === undefined,
+      `got: ${body.adminLastReplyDate}`,
+    );
+    check(
+      "customerLastReplyDate absent (no comments to date)",
+      body.customerLastReplyDate === undefined,
+      `got: ${body.customerLastReplyDate}`,
+    );
+  } finally {
+    await mcp.close();
+    delete process.env.FEATUREBASE_TEAM_USER_IDS;
+  }
+}
+
+// ============================================================
+// SCENARIO 6: get_post on a zero-comment post with NO team.
+// include_comments=false:
+//   - comments field absent (include_comments=false)
+//   - engagement fields remain absent (loud-unknown contract)
+//   - author role stays 'unknown'
+//   - zero comment fetches
+// ============================================================
+console.log("\n=== Scenario 6: get_post zero-comment, no team, include_comments=false ===\n");
+{
+  const board = [
+    buildMockPost({
+      id: "p1", slug: "p1", title: "P1", commentCount: 0,
+      author: { _id: "alice-id", name: "Alice" },
+    }),
+  ];
+  const mock = buildMockFetcher({ listingPages: [board] });
+  const { mcp } = await bootServer({ mock, teamEnv: "" });
+  try {
+    const result = await mcp.callTool({
+      name: "get_featurebase_post",
+      arguments: { slug: "p1", include_comments: false },
+    });
+    check("returned cleanly", !result.isError);
+    const body = parseText(result);
+    check(
+      "no team: comments field absent (include_comments=false)",
+      body.comments === undefined,
+      `got: ${JSON.stringify(body.comments)}`,
+    );
+    check(
+      `ZERO comment fetches happened (got ${mock.commentCount()})`,
+      mock.commentCount() === 0,
+    );
+    check(
+      "no team: post.author.role === 'unknown' (loud-unknown contract)",
+      body.author?.role === "unknown",
+      `got: ${body.author?.role}`,
+    );
+    check(
+      "no team: engagement fields OMITTED (no fabricated zero values)",
+      body.hasAdminReply === undefined &&
+        body.adminReplyCount === undefined &&
+        body.customerCommentCount === undefined,
+      `hasAdminReply=${body.hasAdminReply} adminReplyCount=${body.adminReplyCount} customerCommentCount=${body.customerCommentCount}`,
     );
   } finally {
     await mcp.close();

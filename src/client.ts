@@ -452,6 +452,40 @@ function resolveTeam(
   return { team, configured };
 }
 
+/**
+ * Populate explicit zero engagement for a post whose `commentCount`
+ * is zero, when a team is configured. A zero-comment post definitively
+ * satisfies "the team has not commented" — there were no comments at
+ * all, so the team could not have replied. With no team configured,
+ * keep the loud-unknown contract: leave engagement fields absent
+ * (role="unknown", callers must not see fabricated zero values).
+ *
+ * This helper is the single source of truth for the zero-comment
+ * engagement contract. It is used by:
+ *   - get_featurebase_post(include_comments=false), via
+ *     enrichPostEngagement, to ensure include_comments does not
+ *     affect already-known engagement metadata.
+ *   - get_featurebase_post(include_comments=true) zero-comment branch,
+ *     so the true/false branches can never drift.
+ *   - list_featurebase_posts(hasAdminReply=...) zero-comment branch,
+ *     so the strict-equality filter matches zero-comment posts.
+ *
+ * When `teamConfigured` is false, returns the post unchanged —
+ * engagement fields stay absent.
+ */
+function withZeroCommentEngagement(
+  post: NormalizedPost,
+  teamConfigured: boolean,
+): NormalizedPost {
+  if (!teamConfigured || post.commentCount !== 0) return post;
+  return {
+    ...post,
+    hasAdminReply: false,
+    adminReplyCount: 0,
+    customerCommentCount: 0,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Listing API (paginated)
 // ---------------------------------------------------------------------------
@@ -1012,12 +1046,19 @@ export function createClient(opts: ClientOptions = {}): Client {
     post: NormalizedPost,
     teamUserIds?: string[],
   ): Promise<NormalizedPost> {
-    if (post.commentCount === 0 || post.commentFetchFailed) return post;
+    if (post.commentFetchFailed) return post;
     const { team: effectiveTeam, configured: teamConfigured } = resolveTeam(
       teamUserIds,
       team,
       hasTeam,
     );
+    // Zero-comment posts: no API request is needed. When a team is
+    // configured, populate explicit zero engagement values via the
+    // shared helper so callers see consistent engagement metadata
+    // regardless of include_comments.
+    if (post.commentCount === 0) {
+      return withZeroCommentEngagement(post, teamConfigured);
+    }
     if (!teamConfigured) {
       // No team reference at all — refuse to manufacture classification.
       // Return the post without any engagement fields; the loud-failure
@@ -1134,14 +1175,11 @@ export function createClient(opts: ClientOptions = {}): Client {
           // zero-comment post from hasAdminReply:false (and silently
           // matching them against hasAdminReply:true, since `undefined
           // !== true` is also true). A zero-comment post DEFINITIVELY
-          // satisfies "the team has not commented".
+          // satisfies "the team has not commented". The helper is the
+          // single source of truth for this contract (used by getPost
+          // too) so the literal zero values live in exactly one place.
           if (p.commentCount === 0) {
-            return {
-              ...p,
-              hasAdminReply: false,
-              adminReplyCount: 0,
-              customerCommentCount: 0,
-            };
+            return withZeroCommentEngagement(p, true);
           }
           const result = engById.get(p.id);
           if (result === undefined) return p;
@@ -1263,27 +1301,15 @@ export function createClient(opts: ClientOptions = {}): Client {
       // include_comments=true — single fetch.
       if (post.commentCount === 0) {
         // No comments on this post: skip the fetch entirely, return
-        // the post with empty comments[]. When a team is configured,
-        // populate explicit zero engagement values so callers can
-        // distinguish "no comments yet" from "unclassified". When no
-        // team is configured, keep the loud-unknown contract: omit
-        // engagement fields and let authors stay as role="unknown".
+        // the post with empty comments[]. Engagement is populated by
+        // the same shared helper used by the include_comments=false
+        // path so the true/false branches cannot drift.
+        const enriched = withZeroCommentEngagement(post, teamConfigured);
         const withAuthor = reclassifyPostAuthor(
-          post,
+          enriched,
           effectiveTeam,
           teamConfigured,
         );
-        if (teamConfigured) {
-          return {
-            ...withAuthor,
-            contentHtml,
-            contentText,
-            comments: [],
-            hasAdminReply: false,
-            adminReplyCount: 0,
-            customerCommentCount: 0,
-          };
-        }
         return {
           ...withAuthor,
           contentHtml,
