@@ -1,28 +1,53 @@
 # @kjadeja/open-featurebase-mcp
 
-A reverse-engineered Model Context Protocol (MCP) server for **any public Featurebase feedback board**. Lets Claude Code, Cursor, and any MCP-compatible agent **read** feature requests, comments, and board stats — no API key, no auth, no cookies, no Pro plan required.
+A Model Context Protocol (MCP) server I built for reading public Featurebase feedback boards from any MCP-compatible agent — Claude Code, Cursor, VS Code, others.
 
-> The public Featurebase board is a Next.js SPA that embeds all post data as JSON inside `<script id="__NEXT_DATA__">`. This server extracts and normalizes that JSON into MCP tools. The free Featurebase tier doesn't include the official REST API or MCP — those are gated to the $59/seat/mo Professional plan. This server gives you 100% read access at 0% of the cost.
+I built this for [Remalt](https://itsremalt.featurebase.app) because I wanted my coding agent to be able to answer questions like *"what have users been asking for that we haven't replied to?"*, *"which promised fixes are stalled?"*, and *"what's the most-upvoted unaddressed feedback this week?"* without me copy-pasting from a browser tab.
 
-The default board is the [itsremalt feedback board](https://itsremalt.featurebase.app), but any other public Featurebase board works via the `FEATUREBASE_BOARD_URL` env var.
+The default board is the Remalt one, but it works against any public Featurebase board that exposes the same public listing + comment endpoints.
 
 ## Install
 
-### Quick start: `npx` (recommended for users)
+### Quickest path — `npx`
 
 ```bash
 npx -y @kjadeja/open-featurebase-mcp
 ```
 
-Or install globally:
+This runs the server directly without installing anything. Use this for one-off testing or to confirm the package works on your machine.
+
+To install globally:
 
 ```bash
 npm install -g @kjadeja/open-featurebase-mcp
 ```
 
-### Wire into Claude Code / Cursor
+Then point any MCP client at the binary it adds to your `PATH`:
 
-Add to your project's `.vscode/mcp.json` (or `.cursor/mcp.json`):
+```bash
+which open-featurebase-mcp
+# /usr/local/bin/open-featurebase-mcp   (macOS/Linux)
+// or on Windows:
+where open-featurebase-mcp
+```
+
+## Connecting an MCP client
+
+The setup file format differs across clients — pick the one that matches yours.
+
+### Claude Code
+
+The simplest setup is the CLI:
+
+```bash
+# Use the default Remalt board
+claude mcp add --transport stdio --scope user featurebase -- npx -y @kjadeja/open-featurebase-mcp
+
+# Or point at a different board
+claude mcp add --transport stdio --scope user --env FEATUREBASE_BOARD_URL=https://example.featurebase.app featurebase -- npx -y @kjadeja/open-featurebase-mcp
+```
+
+If you prefer to keep it in a file, use `.mcp.json` in the project root with the `mcpServers` (note the camelCase) key:
 
 ```json
 {
@@ -38,167 +63,244 @@ Add to your project's `.vscode/mcp.json` (or `.cursor/mcp.json`):
 }
 ```
 
-Reload the MCP server list. The `featurebase` server appears with seven read-only tools.
+### Cursor
 
-> The `FEATUREBASE_BOARD_URL` env var is **optional** — when omitted, the server defaults to the itsremalt board. Set it to point at any other public Featurebase board (e.g. `https://acme.featurebase.app`).
+Cursor uses `.cursor/mcp.json` in the project root, with the `mcpServers` key:
 
-### From source (contributors / development)
-
-```bash
-git clone https://github.com/K-Jadeja/open-featurebase-mcp
-cd open-featurebase-mcp
-npm install
-npm run build
-npm start
+```json
+{
+  "mcpServers": {
+    "featurebase": {
+      "command": "npx",
+      "args": ["-y", "@kjadeja/open-featurebase-mcp"],
+      "env": {
+        "FEATUREBASE_BOARD_URL": "https://itsremalt.featurebase.app"
+      }
+    }
+  }
+}
 ```
 
-## What it does
+### VS Code (GitHub Copilot Chat or other MCP-aware extensions)
 
-Seven read-only tools:
+VS Code uses `.vscode/mcp.json`, with a top-level `servers` (not `mcpServers`) key:
 
-| Tool | Purpose |
-|---|---|
-| `list_featurebase_posts` | List posts, filterable by status, sortable by date/upvotes. Posts carry engagement metadata (admin/customer reply counts + dates). |
-| `get_featurebase_post` | Get one post by slug + full body + optional comment thread |
-| `get_featurebase_posts` | **Batch fetch** multiple posts in one call (no round-trip overhead) |
-| `search_featurebase_posts` | Keyword search over titles + bodies, ranked by relevance |
-| `get_featurebase_stats` | Board-wide aggregates: counts by status, top-voted, most recent |
-| `get_featurebase_stalled_promises` | Find posts where admin replied, customer spoke last, and admin has been silent for N+ days. Surfaces follow-ups you promised but forgot. |
-| `find_featurebase_user` | Look up user IDs by partial name match (post authors + comment authors). Use the returned IDs as `teamUserIds` in stalled-promises so the agent doesn't need the `FEATUREBASE_TEAM_USER_IDS` env var. |
+```json
+{
+  "servers": {
+    "featurebase": {
+      "command": "npx",
+      "args": ["-y", "@kjadeja/open-featurebase-mcp"],
+      "env": {
+        "FEATUREBASE_BOARD_URL": "https://itsremalt.featurebase.app"
+      }
+    }
+  }
+}
+```
 
-All results are normalized to clean JSON shapes (no HTML in the agent-facing output, just structured data + plain-text excerpts).
+> **Note**: The three file formats are NOT interchangeable. `.vscode/mcp.json` uses `servers`; Claude Code and Cursor use `mcpServers`. Copy the exact form above for your editor.
+
+After editing the file, reload the editor so it picks up the new server. The seven tools below will appear in the MCP tools list.
 
 ## Configuration
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `FEATUREBASE_BOARD_URL` | `https://itsremalt.featurebase.app` | Point at any public Featurebase board. |
-| `FEATUREBASE_TEAM_USER_IDS` | (unset) | Comma-separated Featurebase user IDs considered team. Used only for admin/customer classification on `list_featurebase_posts(hasAdminReply=…)` and `get_featurebase_stalled_promises`. **Optional.** |
+| `FEATUREBASE_BOARD_URL` | `https://itsremalt.featurebase.app` | The public Featurebase board to read from. Optional — set this only if you want a different board. |
+| `FEATUREBASE_TEAM_USER_IDS` | (unset) | Comma-separated Featurebase user IDs considered team. Used for admin/customer classification. **Optional.** |
 
-### Team IDs — when you need them, when you don't
+### When team IDs matter
 
-**Without `FEATUREBASE_TEAM_USER_IDS`** (or `teamUserIds` override) the server still works for everything except team-aware classification:
+Most tools work without any team configuration — they read posts, comments, search, stats, batch-fetch, and user lookup without knowing who's on the team. Team IDs are only needed when you want to classify authors or detect stalled follow-ups:
 
-| Tool | Works without team IDs? | Notes |
+| Tool | Without team IDs | With team IDs |
 |---|---|---|
-| `list_featurebase_posts` (no `hasAdminReply`) | ✅ Yes | Listing + filtering + sorting all work. |
-| `get_featurebase_post` | ✅ Yes | Post body + comments all work; `author.role` is `"unknown"`. |
-| `get_featurebase_posts` | ✅ Yes | Batch fetch works. |
-| `search_featurebase_posts` | ✅ Yes | Keyword search works. |
-| `get_featurebase_stats` | ✅ Yes | Stats work. |
-| `find_featurebase_user` | ✅ Yes | User lookup + `totalCommentCount` work. |
-| `list_featurebase_posts(hasAdminReply=…)` | ❌ Errors with `InvalidParams` | Throws rather than silently returning wrong results. |
-| `get_featurebase_stalled_promises` | ⚠️ Returns empty with `warning` | Use `find_featurebase_user` to discover user IDs, then pass them as `teamUserIds`. |
+| `list_featurebase_posts` (no `hasAdminReply`) | ✅ Works | ✅ Same result |
+| `get_featurebase_post` | ✅ Works; `author.role === "unknown"` | ✅ Authors classified; engagement fields populated |
+| `get_featurebase_posts` | ✅ Works | ✅ Authors classified |
+| `search_featurebase_posts` | ✅ Works | ✅ Authors classified |
+| `get_featurebase_stats` | ✅ Works | ✅ Same result |
+| `find_featurebase_user` | ✅ Works; `totalCommentCount` still accurate | ✅ Same result |
+| `list_featurebase_posts(hasAdminReply=…)` | ❌ Throws `InvalidParams` | ✅ Filters posts |
+| `get_featurebase_stalled_promises` | ⚠️ Returns empty with a `warning` | ✅ Returns stalled promises |
 
-This is a **loud-failure contract**: when team classification is required but no team is configured, the tool errors out — never silently fabricates `customer`/`admin` assignments. To enable the team-aware tools, either set `FEATUREBASE_TEAM_USER_IDS=id1,id2,…` in the env, or call `find_featurebase_user` with your name and use the returned IDs as `teamUserIds` per-call.
+When a tool requires a team identity and none is configured, it errors out rather than silently fabricate `customer` / `admin` assignments. To enable the team-aware tools, either set `FEATUREBASE_TEAM_USER_IDS=id1,id2,…` in the env, or call `find_featurebase_user` with your name to discover IDs and pass them as `teamUserIds` per-call.
 
-## Known limitations
+## Practical prompts
 
-- **Admin role tagging requires team IDs.** `/api/v1/organization.admins` only holds the org owner (not the team that comments), so this MCP deliberately doesn't use it as a team source. Set `FEATUREBASE_TEAM_USER_IDS=id1,id2,…` in the env, or pass `teamUserIds` per-call to `get_featurebase_stalled_promises` after calling `find_featurebase_user`. Without one of these, `hasAdminReply` and `get_featurebase_stalled_promises` refuse to fabricate classifications.
-- **No writes.** Reading only — posting comments, voting, changing status all require authenticated API access, gated to Featurebase's $59/seat/mo Professional plan. Out of scope for a reverse-engineered scraper.
-- **No authentication.** The server reads publicly-served data. Boards that require sign-in or have aggressive bot protection will not work.
+These are the workflows I actually run. Paste them into Claude Code / Cursor after the MCP server is connected.
 
-## Tool reference
+### Daily triage
+
+> Show me the top 10 most-upvoted open posts that don't yet have an admin reply. For each one, summarize the request and quote the highest-voted customer comment.
+
+This uses `list_featurebase_posts(hasAdminReply=false, status="open", sortBy="upvotes:desc", teamUserIds=[…])` followed by `get_featurebase_post` for the top entries.
+
+### Find stalled follow-ups
+
+> Which posts have I (the team) replied to, the customer replied after me, and I haven't said anything in over a week? Show the last 5 by staleness, with the customer's last message quoted.
+
+This is exactly `get_featurebase_stalled_promises({ minDaysSinceAdminReply: 7 })`.
+
+### Detect duplicates
+
+> Search the board for "export to CSV" and "download as spreadsheet". Cluster the matches by similarity and tell me which ones look like duplicates I should merge.
+
+This uses `search_featurebase_posts` for both queries and then a similarity grouping.
+
+### Create a GitHub issue from a feature request
+
+> Take post `more-byok-options`, summarize it as a single-paragraph problem statement, and produce a GitHub-issue-formatted markdown block (title + body) that I can paste into our repo.
+
+The agent reads the post body, formats it, and you paste the result into GitHub.
+
+### Voice-of-customer report
+
+> Read the 20 most-recent open posts. Group them by theme. For each theme, give me: how many users mentioned it, the total upvotes, and one representative quote.
+
+This uses `list_featurebase_posts(status="open", sortBy="date:desc", limit=20)` plus per-post comment reads.
+
+### Find unanswered posts
+
+> List all open posts in the In Progress category with zero admin replies. These are the ones we should respond to first.
+
+This is `list_featurebase_posts(hasAdminReply=false, status="in_progress")`.
+
+### Discover your team IDs
+
+> Find my user ID on this board. My name is "Krishna".
+
+This uses `find_featurebase_user({ name: "Krishna" })`. Use the returned IDs as `teamUserIds` in subsequent calls — no env-var setup needed.
+
+## Tools
+
+Seven read-only tools. Each one is designed to be cheap enough to chain — most listing calls don't fetch comments at all unless you ask for engagement.
 
 ### `list_featurebase_posts`
-**Args:** `status?` (`open`/`planned`/`in_progress`/`complete`/`all`, default `all`), `sortBy?` (`date:desc`/`date:asc`/`upvotes:desc`, default `date:desc`), `limit?` (1–200, default 50), `hasAdminReply?` (boolean — requires a team identity; see above), `teamUserIds?` (string[] — runtime override)
+
+**Args:**
+
+- `status` — one of: `all` (default), `open`, `in_review`, `planned`, `in_progress`, `completed`. **Note:** the underlying `postStatus.type` for "In Progress" is `reviewing`; for "Planned" it's `unstarted`. The friendly names above are what you pass in.
+- `sortBy` — `date:desc` (default), `date:asc`, or `upvotes:desc`.
+- `limit` — 1–200, default 50.
+- `hasAdminReply` — optional boolean. **Requires** a team identity (env var or `teamUserIds` override). If neither is set, the call throws `InvalidParams`.
+- `teamUserIds` — optional string[] override for the team.
 
 **Returns:** `{ totalResults, availableResults, truncated, returned, posts: NormalizedPost[] }`
 
-Each post in `posts[]` carries engagement metadata: `hasAdminReply`, `adminReplyCount`, `customerCommentCount`, `lastCommentDate`, `adminLastReplyDate`, `customerLastReplyDate`, and `commentFetchFailed` (only set when the comments fetch failed for that post). The enrichment is lazy — only posts with `commentCount > 0` are fetched, with concurrency capped at 8.
+**Behavior:**
+
+- A normal listing call (no `hasAdminReply`) does **not** fetch comments and does **not** populate engagement metadata. It returns posts with `author.role === "unknown"` when no team is configured.
+- When `hasAdminReply` is provided, comments are fetched for posts with `commentCount > 0` and engagement is computed under the team. Posts with `commentCount === 0` are treated as `hasAdminReply: false` (the team definitively has not replied) without a comment API request.
 
 ### `get_featurebase_post`
-**Args:** `slug` (required), `include_comments?` (default `false`), `teamUserIds?` (string[] — runtime override)
 
-**Returns:** `{ ...NormalizedPost, contentHtml, contentText, comments?: NormalizedComment[], commentsError?: string }`
+**Args:**
 
-**Always returns the full body** (contentHtml + contentText inlined on the post object). When `include_comments=true`, the full comment thread is inlined as a nested `comments` array (top-level comments with `replies[]` for replies). Each comment carries author (name, userId, role), bodyHtml, bodyText, createdAt, updatedAt, upvotes, parentId. If the comments fetch fails, the post is still returned with `commentsError` set — no silent degradation.
+- `slug` — required (e.g. `more-byok-options`).
+- `include_comments` — default `false`. When `true`, inlines the full comment thread as `comments: NormalizedComment[]`.
+- `teamUserIds` — optional string[] override.
 
-When `teamUserIds` is passed, comment authors (and engagement fields) are re-classified using these IDs as the team. A non-empty `teamUserIds` array **replaces** `FEATUREBASE_TEAM_USER_IDS` for that call only; an empty array `[]` is treated as absent (the env var is used if configured).
+**Returns:** `{ ...NormalizedPost, contentHtml, contentText, comments?, commentsError? }`
+
+`contentHtml` and `contentText` are always inlined. If the comments fetch fails, `commentsError` is set and the post is still returned.
+
+When `teamUserIds` is supplied, both comment-author roles and engagement fields are reclassified against that team. A non-empty `teamUserIds` array **replaces** `FEATUREBASE_TEAM_USER_IDS` for that call only; an empty array `[]` is treated as absent (the env var is used if configured).
 
 ### `get_featurebase_posts` (batch)
-**Args:** `slugs` (required, 1–20), `include_content?` (default `false`)
 
-**Returns:** `{ requested, found, notFound?, posts: (NormalizedPost | NormalizedPostDetail)[] }`
+**Args:** `slugs` (1–20), `include_content` (default `false`).
 
-Returns posts in the order requested. Missing slugs go into `notFound` instead of throwing. Set `include_content=true` to inline `contentHtml` + `contentText` on each post in `posts[]`.
-
-**When to use which:**
-- `get_featurebase_post` (singular) — for 1–3 posts. Always returns full body. Errors loudly if slug not found.
-- `get_featurebase_posts` (batch) — for 4+ posts. Lighter default, opt-in full body, partial-miss tolerant (notFound).
+Returns posts in the order requested; missing slugs go into `notFound` rather than throwing. Set `include_content=true` to inline full body on each entry.
 
 ### `search_featurebase_posts`
-**Args:** `query` (required), `limit?` (1–50, default 10)
 
-**Returns:** `{ query, totalMatches, returned, posts: NormalizedPost[] }` ordered by relevance (title hit = 3 pts, body hit = 1 pt, per-token matches also weighted).
+**Args:** `query` (required), `limit` (1–50, default 10).
+
+Returns posts ordered by relevance (title hit = 3 pts, body hit = 1 pt, per-token matches also weighted).
 
 ### `get_featurebase_stats`
-**Args:** `topVotedLimit?` (1–50, default 5), `recentLimit?` (1–50, default 5)
+
+**Args:** `topVotedLimit` (1–50, default 5), `recentLimit` (1–50, default 5).
 
 **Returns:** `{ totalResults, snapshotSize, truncated, snapshotWindow, statusCountsInSnapshot, categoryCountsInSnapshot, topVoted[N], recent[N] }`
 
-`snapshotWindow` is `{ from: "YYYY-MM-DD", to: "YYYY-MM-DD", ordering: "date desc" }` — the actual date range the SSR snapshot covers. Counts are labeled `*InSnapshot` to make explicit they're computed over the SSR-bundled subset, not the full board.
+`snapshotWindow` is the actual date range currently in the in-memory snapshot — labels like `*InSnapshot` are explicit that these counts are over the snapshot, not over a complete board snapshot from a single source. The snapshot is built on demand from the public listing endpoint and is fresh as of the first fetch in the current process.
 
 ### `get_featurebase_stalled_promises`
-**Args:** `minDaysSinceAdminReply?` (0–365, default 7), `limit?` (1–50, default 20), `teamUserIds?` (string[]), `status?` (string[] — restrict to these statuses), `sortBy?` (`staleness`/`freshness`/`upvotes`, default `staleness`)
+
+**Args:**
+
+- `minDaysSinceAdminReply` — 0–365, default 7.
+- `limit` — 1–50, default 20.
+- `teamUserIds` — optional string[] override.
+- `status` — restrict candidates to one of these statuses.
+- `sortBy` — `staleness` (default), `freshness`, or `upvotes`.
 
 **Returns:** `{ minDaysSinceAdminReply, teamSource, warning?, unusedTeamUserIds?, unusedTeamUserIdsComplete?, totalCandidates, returned, promises: StalledPromise[] }`
 
-`teamSource` is `"override"` when `teamUserIds` was passed (and `FEATUREBASE_TEAM_USER_IDS` env var was bypassed), `"default"` when env-var-driven, or `"none"` when no team is available (returns empty with `warning`).
+`teamSource` is `"override"` (per-call team), `"default"` (env-var team), or `"none"` (no team — returns empty with a warning).
 
-`unusedTeamUserIds` is set when `teamUserIds` was passed with at least one ID that didn't appear in any comment thread. `unusedTeamUserIdsComplete: false` signals that some comment fetches failed and we couldn't fully determine unused IDs.
-
-`status` accepts any of `["open", "in_review", "planned", "in_progress", "completed"]` and restricts candidates.
-
-`sortBy` controls response order:
-- `"staleness"` (default): `customerLastReplyDate` desc — most-recent stalled promises first
-- `"freshness"`: `adminLastReplyDate` desc — most-recent admin replies first (catch up on what you just said)
-- `"upvotes"`: `upvotes` desc — focus on high-impact items regardless of staleness
-
-This is the "I said I'd look into it in a comment and forgot to follow up" view. Two ways to identify admins:
-1. **Auto**: set `FEATUREBASE_TEAM_USER_IDS` env var (recommended for production)
-2. **Self-service**: ask the user for their name, call `find_featurebase_user` to look up the IDs, then pass them as `teamUserIds`
+`unusedTeamUserIds` lists IDs you supplied that didn't appear in any comment thread. `unusedTeamUserIdsComplete: false` signals that some comment fetches failed and we couldn't fully determine unused IDs.
 
 ### `find_featurebase_user`
-**Args:** `name` (required, partial match, case-insensitive, min 2 chars), `sampleSize?` (0–20, default 5)
+
+**Args:** `name` (≥2 chars, partial match), `sampleSize` (0–20, default 5).
 
 **Returns:** `{ query, samplePostsScanned, commentsComplete, warning?, matches: UserMatch[] }`
 
-Each `UserMatch` carries: `userId`, `name`, `postCount`, `commentCountInSampledPosts` (within `sampleSize` recent threads), `totalCommentCount` (board-wide — main signal), `guessedRole` (`"admin"` if user never posts but does comment, `"customer"` otherwise).
+`commentsComplete` is `true` only when every comment fetch for the index build succeeded; `false` means totals may undercount.
 
-`commentsComplete` is `true` only when every comment fetch succeeded; `false` means at least one fetch failed and totals may undercount.
+Each `UserMatch` carries `userId`, `name`, `postCount`, `commentCountInSampledPosts`, `totalCommentCount` (board-wide), and `guessedRole`.
 
-**Sort order**: `guessedRole === "admin"` first (most likely team), then by `totalCommentCount` desc.
+## Known limitations
 
-## How it works
+- **Reads only.** Posting comments, voting, changing status all require authenticated access to Featurebase — out of scope.
+- **Designed for public boards.** Works on Remalt and on other public boards that expose the same public listing + comment endpoints. Boards with aggressive bot protection, sign-in walls, or non-standard layouts may not work.
+- **No real-time updates.** The in-memory snapshot is fresh on first fetch in a given process and cached for 5 minutes. Restart the server to flush.
+- **Admin role tagging requires team IDs.** Without `FEATUREBASE_TEAM_USER_IDS` (or a per-call `teamUserIds`), author roles are `"unknown"` and `hasAdminReply` filtering is refused.
 
-1. `GET {BASE_URL}/api/v1/submission?sortBy=date:desc&inReview=false&includePinned=true&page=N` returns JSON directly (the SPA's axios baseURL is `/api`).
-2. First call to page 1 discovers `totalPages` + `totalResults`. Remaining pages are fetched in parallel via `Promise.allSettled`. **Multi-page listing retrieval is atomic**: if any required page fails, the entire tool call surfaces the failure (no partial listing is cached or returned). Retry on the same client refetches every page from scratch.
-3. Role tagging uses ONLY `FEATUREBASE_TEAM_USER_IDS` env var (or per-call `teamUserIds` override) — `/api/v1/organization.admins` is deliberately ignored because it holds the org owner, not the team. When neither is set, every author is `role: "unknown"` and engagement fields are omitted from listing responses.
-4. All listing pages are concatenated into a single in-memory snapshot, normalized (HTML stripped, fields flattened), and cached for 5 minutes.
-5. Filter/sort happen client-side so the cache stays valid across all sort orders and filter combinations.
-6. When `get_featurebase_post(include_comments=true)` is called, `/api/v1/comment?submissionId=<id>` fetches the comment thread (top-level comments + nested replies). **Multi-page comment retrieval is also atomic**: a single failed page throws and is never cached as a partial thread.
-7. No DOM scraping, no cheerio, no HTML parsing — JSON throughout.
+## How it works (briefly)
+
+1. The public board exposes `/api/v1/submission?…&page=N` (the SPA's axios `baseURL` is `/api`). The server calls page 1 to learn `totalPages` and `totalResults`, then fetches pages 2..N concurrently. **Listing pagination is atomic** — if any required page fails, the entire tool call surfaces the failure and no partial listing is cached or returned.
+2. `/api/v1/comment?submissionId=<id>&page=N` returns the comment thread. **Comment pagination is also atomic** — a single failed page throws and is never cached as a partial thread.
+3. Engagement fields (`hasAdminReply`, counts, dates) are computed from the classified comment tree. The cache is role-neutral: roles are derived per request against the active team set, never stored on the cached tree.
 
 ## Troubleshooting
 
-**`HTTP 404` from `/api/v1/submission`**
-The board's API host may have changed (unlikely — has been stable for months). Try the alternate path `/v1/submission` (without the `/api` prefix) — some boards expose the endpoint there instead. If both fail, the board has likely been migrated or taken private.
+**Listing fails with `Incomplete listing: failed pages N of M`**
+The listing endpoint returned an error on one or more pages. The tool call surfaces this failure — no partial listing is returned or cached. Retry on the same client will refetch every listing page from scratch. This is by design (atomic contract).
 
-**`HTTP 403 Forbidden`**
-The board's Cloudflare or bot protection is blocking the request. Try again after a short delay, or fall back to opening the board in a browser.
+**`engagementComplete: false` in a `list_featurebase_posts(hasAdminReply=…)` response**
+Means one or more specific comment-thread fetches failed during engagement enrichment. The response includes `failedPostSlugs` listing which posts couldn't be classified. Posts that did succeed are still filtered correctly; only the affected posts get `commentFetchFailed: true` and are excluded from the filter result. Retry the request after a short delay.
 
-**Stale data**
-In-memory cache, TTL-based (5 min for listing + comments). Restart the server to flush.
+**`commentsComplete: false` in `find_featurebase_user`**
+At least one post's comments failed to fetch while building the board-wide user-count index. `totalCommentCount` for users who only appeared in failed threads may undercount. Retry after a short delay.
 
-**`truncated: true` or `engagementComplete: false` in responses**
-Means one or more pages failed to fetch — partial snapshot. Use `snapshotSize` vs `totalResults` to see the gap, or `failedPostSlugs` to identify which posts couldn't be enriched. Restart the server to retry.
+**All author roles show `"unknown"`**
+No team is configured. Either set `FEATUREBASE_TEAM_USER_IDS` in the env, or use `find_featurebase_user` to discover IDs and pass them as `teamUserIds` per-call.
 
-**Comments fetch fails (`commentsError` is set)**
-The post is still returned; check `commentsError` for the reason. Common causes: network error, rate limit, or the comment endpoint returning an unexpected shape. Restart retries.
+**`hasAdminReply` filter throws `InvalidParams`**
+You asked for a team-based filter without providing a team. Set `FEATUREBASE_TEAM_USER_IDS` or pass `teamUserIds` to the call.
 
-**All comment authors show `role: "unknown"` and engagement fields are missing**
-The MCP deliberately doesn't trust `/api/v1/organization.admins` (it holds the org owner, not your comment-reply team). To activate role tagging, either set `FEATUREBASE_TEAM_USER_IDS=id1,id2` in the env, or call `find_featurebase_user` to discover IDs and pass them via `teamUserIds` to `get_featurebase_stalled_promises`.
+**`commentsError` is set on a `get_featurebase_post` response**
+The post is still returned with its body and metadata; only the comments array is missing. Common causes: network error, rate limit, or the comment endpoint returning an unexpected shape.
+
+## For contributors
+
+If you want to develop on this:
+
+```bash
+git clone https://github.com/K-Jadeja/open-featurebase-mcp
+cd open-featurebase-mcp
+npm ci
+npm run build
+npm test         # 339 deterministic checks; no live network
+npm start        # launches the stdio server
+```
+
+The default `npm test` is fully offline (mock fetcher fixtures). A separate `npm run test:live` runs against a live Featurebase endpoint and is opt-in.
 
 ## License
 

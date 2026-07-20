@@ -1,6 +1,6 @@
 {
   "name": "@kjadeja/open-featurebase-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Reverse-engineered MCP server for any public Featurebase feedback board — read-only access (list, search, stats, comments, stalled promises) without an API key or Pro plan.",
   "type": "module",
   "exports": {
@@ -29,7 +29,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "tsx": "^4.3.0",
+    "tsx": "^4.0.0",
     "typescript": "^5.3.0"
   },
   "engines": {
