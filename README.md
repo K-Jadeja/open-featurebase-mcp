@@ -47,6 +47,41 @@ claude mcp add --transport stdio --scope user featurebase -- npx -y @kjadeja/ope
 claude mcp add --transport stdio --scope user --env FEATUREBASE_BOARD_URL=https://example.featurebase.app featurebase -- npx -y @kjadeja/open-featurebase-mcp
 ```
 
+#### Native Windows (not WSL)
+
+On native Windows, Claude Code needs `cmd /c` around local `npx` MCP servers:
+
+```powershell
+# Use the default Remalt board
+claude mcp add --transport stdio --scope user featurebase -- cmd /c npx -y @kjadeja/open-featurebase-mcp
+
+# Or point at a different board
+claude mcp add --transport stdio --scope user --env FEATUREBASE_BOARD_URL=https://example.featurebase.app featurebase -- cmd /c npx -y @kjadeja/open-featurebase-mcp
+```
+
+For a project-root `.mcp.json` on native Windows:
+
+```json
+{
+  "mcpServers": {
+    "featurebase": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@kjadeja/open-featurebase-mcp"
+      ],
+      "env": {
+        "FEATUREBASE_BOARD_URL": "https://itsremalt.featurebase.app"
+      }
+    }
+  }
+}
+```
+
+WSL uses the macOS/Linux form with `command: "npx"`.
+
 If you prefer to keep it in a file, use `.mcp.json` in the project root with the `mcpServers` (note the camelCase) key:
 
 ```json
@@ -163,7 +198,7 @@ This uses `list_featurebase_posts(status="open", sortBy="date:desc", limit=20)` 
 
 ### Find unanswered posts
 
-> List all open posts with the `in_progress` status that have zero admin replies. These are the ones we should respond to first.
+> List all posts with the `in_progress` status that have zero admin replies. These are the ones we should respond to first.
 
 This is `list_featurebase_posts(hasAdminReply=false, status="in_progress")`.
 

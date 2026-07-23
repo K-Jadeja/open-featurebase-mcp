@@ -1,0 +1,75 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish trusted release
+    if: github.repository == 'K-Jadeja/open-featurebase-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          EXPECTED_TAG="v${VERSION}"
+
+          if [ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package version ${VERSION}."
+            echo "Expected tag: ${EXPECTED_TAG}"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      # npm publish automatically runs:
+      #   prepublishOnly -> npm test
+      #   prepack        -> clean + build
+      - name: Publish package with npm trusted publishing
+        run: npm publish --access public
+
+      - name: Verify published version
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+
+          for attempt in {1..12}; do
+            PUBLISHED="$(
+              npm view "@kjadeja/open-featurebase-mcp@${VERSION}" version 2>/dev/null || true
+            )"
+
+            if [ "${PUBLISHED}" = "${VERSION}" ]; then
+              echo "Verified @kjadeja/open-featurebase-mcp@${VERSION} on npm."
+              exit 0
+            fi
+
+            echo "Registry has not returned ${VERSION} yet; retrying in 5 seconds..."
+            sleep 5
+          done
+
+          echo "npm did not confirm version ${VERSION} after publication."
+          exit 1
