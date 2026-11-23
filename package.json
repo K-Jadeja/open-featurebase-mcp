@@ -1,10 +1,10 @@
 {
   "name": "@kjadeja/open-featurebase-mcp",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Read-only MCP server for public Featurebase boards exposing the standard public listing and comment endpoints.",
   "type": "module",
   "bin": {
-    "open-featurebase-mcp": "./dist/index.js"
+    "open-featurebase-mcp": "dist/index.js"
   },
   "files": [
     "dist",

@@ -24,11 +24,10 @@ jobs:
       - name: Checkout tagged commit
         uses: actions/checkout@v6
 
-      - name: Set up Node.js and npm registry
+      - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
       - name: Verify tag matches package version
@@ -46,11 +45,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build package before publish
+        # dist/index.js must exist before npm publish validates package.json#bin,
+        # otherwise npm@11 strips bin[open-featurebase-mcp] prior to prepack.
+        run: npm run build
+
       # npm publish automatically runs:
       #   prepublishOnly -> npm test
       #   prepack        -> clean + build
       - name: Publish package with npm trusted publishing
-        run: npm publish --access public
+        run: npm publish --provenance --access public
 
       - name: Verify published version
         shell: bash
