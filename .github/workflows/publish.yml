@@ -61,17 +61,20 @@ jobs:
         run: |
           VERSION="$(node -p "require('./package.json').version")"
 
-          for attempt in {1..12}; do
+          for attempt in {1..36}; do
             PUBLISHED="$(
-              npm view "@kjadeja/open-featurebase-mcp@${VERSION}" version 2>/dev/null || true
+              npm view "@kjadeja/open-featurebase-mcp@${VERSION}" version --prefer-online 2>/dev/null || true
+            )"
+            BIN_ENTRY="$(
+              npm view "@kjadeja/open-featurebase-mcp@${VERSION}" bin.open-featurebase-mcp --prefer-online 2>/dev/null || true
             )"
 
-            if [ "${PUBLISHED}" = "${VERSION}" ]; then
-              echo "Verified @kjadeja/open-featurebase-mcp@${VERSION} on npm."
+            if [ "${PUBLISHED}" = "${VERSION}" ] && [ -n "${BIN_ENTRY}" ]; then
+              echo "Verified @kjadeja/open-featurebase-mcp@${VERSION} (bin: ${BIN_ENTRY}) on npm."
               exit 0
             fi
 
-            echo "Registry has not returned ${VERSION} yet; retrying in 5 seconds..."
+            echo "Registry has not confirmed ${VERSION} yet (attempt ${attempt}/36); retrying in 5 seconds..."
             sleep 5
           done
 
